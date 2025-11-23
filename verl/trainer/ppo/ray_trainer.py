@@ -928,6 +928,17 @@ class RayPPOTrainer:
             # Extract necessary data
             responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
             attention_mask = gen_batch_output.batch.get("attention_mask")
+            
+            # Get valid vocabulary range to filter out invalid tokens
+            try:
+                tokenizer_size = len(self.tokenizer)
+            except Exception:
+                tokenizer_size = None
+            vocab_size_prop = getattr(self.tokenizer, "vocab_size", None)
+            valid_vocab_size = None
+            for v in (tokenizer_size, vocab_size_prop):
+                if isinstance(v, int) and v > 0:
+                    valid_vocab_size = v if valid_vocab_size is None else max(valid_vocab_size, v)
 
             # Get the original input_ids from gen_batch_output or reconstruct
             # The generated batch should have the full sequence (input + response)
@@ -1030,28 +1041,9 @@ class RayPPOTrainer:
             branched_input_ids = torch.cat(padded_input_ids, dim=0)
             branched_attention_mask = torch.cat(padded_attention_mask, dim=0)
 
-
-            # Sanity checks to avoid out-of-vocabulary errors downstream
+            # Ensure proper dtype for token IDs
             if branched_input_ids.dtype != torch.long:
                 branched_input_ids = branched_input_ids.long()
-
-            try:
-                tokenizer_size = len(self.tokenizer)
-            except Exception:
-                tokenizer_size = None
-            vocab_size_prop = getattr(self.tokenizer, "vocab_size", None)
-            allowed_vocab_size = None
-            for v in (tokenizer_size, vocab_size_prop):
-                if isinstance(v, int) and v > 0:
-                    allowed_vocab_size = v if allowed_vocab_size is None else max(allowed_vocab_size, v)
-            
-            if allowed_vocab_size is not None:
-                max_token_id = int(branched_input_ids.max().item())
-                min_token_id = int(branched_input_ids.min().item())
-                if min_token_id < 0 or max_token_id >= allowed_vocab_size:
-                    print(f"[warn] token id range [{min_token_id}, {max_token_id}] exceeds tokenizer size {allowed_vocab_size}; continuing.")
-                    branched_input_ids = branched_input_ids.clamp(min=0, max=allowed_vocab_size - 1)
-
 
             # Compute and include position_ids for branched generation
             from verl.utils.model import compute_position_id_with_mask
@@ -1097,7 +1089,7 @@ class RayPPOTrainer:
                             pad_len = max_seq_len - orig_tensor.shape[1]
                             pad_shape = list(orig_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.zeros(pad_shape, dtype=orig_tensor.dtype, device=orig_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=orig_tensor.dtype, device=orig_tensor.device)
                             orig_tensor = torch.cat([orig_tensor, padding], dim=1)
 
                         # Pad branched tensor if needed
@@ -1105,7 +1097,7 @@ class RayPPOTrainer:
                             pad_len = max_seq_len - branch_tensor.shape[1]
                             pad_shape = list(branch_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.zeros(pad_shape, dtype=branch_tensor.dtype, device=branch_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=branch_tensor.dtype, device=branch_tensor.device)
                             branch_tensor = torch.cat([branch_tensor, padding], dim=1)
 
                         combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
