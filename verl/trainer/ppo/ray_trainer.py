@@ -906,241 +906,6 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    def _create_branched_rollouts(
-        self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict
-    ) -> DataProto:
-        """
-        Creates branched rollouts from the original generated rollouts.
-        For each rollout, picks a random point in the trajectory and branches off,
-        generating a new continuation. Returns a combined batch with 2n rollouts.
-
-        Args:
-            original_batch: The original batch (unrepeated) with prompts
-            gen_batch_output: The generated batch output with n rollouts per prompt
-            timing_raw: Dictionary for tracking timing metrics
-
-        Returns:
-            DataProto: Combined batch with original and branched rollouts (2n total)
-        """
-        import random
-
-        with marked_timer("branch_rollouts", timing_raw, color="magenta"):
-            # Extract necessary data
-            responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
-            attention_mask = gen_batch_output.batch.get("attention_mask")
-            
-            # Get valid vocabulary range to filter out invalid tokens
-            try:
-                tokenizer_size = len(self.tokenizer)
-            except Exception:
-                tokenizer_size = None
-            vocab_size_prop = getattr(self.tokenizer, "vocab_size", None)
-            valid_vocab_size = None
-            for v in (tokenizer_size, vocab_size_prop):
-                if isinstance(v, int) and v > 0:
-                    valid_vocab_size = v if valid_vocab_size is None else max(valid_vocab_size, v)
-
-            # Get the original input_ids from gen_batch_output or reconstruct
-            # The generated batch should have the full sequence (input + response)
-            if "input_ids" in gen_batch_output.batch:
-                full_input_ids = gen_batch_output.batch["input_ids"]
-            else:
-                # If input_ids not in gen_batch_output, we need to get them from original_batch
-                # and repeat to match the rollouts
-                n_rollouts = self.config.actor_rollout_ref.rollout.n
-                original_input_ids = original_batch.batch["input_ids"]
-                full_input_ids = original_input_ids.repeat_interleave(n_rollouts, dim=0)
-
-            batch_size = responses.shape[0]
-            response_length = responses.shape[1]
-
-            # Create branched rollouts
-            branched_batches = []
-
-            for idx in range(batch_size):
-                # Get the current response
-                current_response = responses[idx]
-
-                # Find valid positions (non-padding tokens)
-                if attention_mask is not None:
-                    response_mask = attention_mask[idx, -response_length:]
-                    valid_positions = torch.where(response_mask > 0)[0]
-                else:
-                    # If no mask, assume all positions are valid
-                    valid_positions = torch.arange(response_length, device=responses.device)
-
-                # Skip if response is too short (need at least 2 valid tokens to branch)
-                if len(valid_positions) < 2:
-                    # If too short, use the full response as branch point (essentially duplicate)
-                    branch_point = response_length
-                else:
-                    # Randomly select a branch point (excluding the last token to allow continuation)
-                    branch_point_idx = random.randint(0, len(valid_positions) - 2)
-                    branch_point = valid_positions[branch_point_idx].item() + 1  # +1 to include selected token
-
-                # Create new input that includes the truncated response
-                if "input_ids" in gen_batch_output.batch:
-                    # We have full input_ids, truncate the response part
-                    prompt_length = full_input_ids.shape[1] - response_length
-                    truncated_input_ids = torch.cat([
-                        full_input_ids[idx, :prompt_length],  # Original prompt
-                        responses[idx, :branch_point]  # Truncated response
-                    ], dim=0)
-                else:
-                    # Reconstruct from original batch
-                    n_rollouts = self.config.actor_rollout_ref.rollout.n
-                    original_idx = idx // n_rollouts
-                    truncated_input_ids = torch.cat([
-                        original_batch.batch["input_ids"][original_idx],
-                        responses[idx, :branch_point]
-                    ], dim=0)
-
-                # Create attention mask for the truncated input
-                truncated_attention_mask = torch.ones_like(truncated_input_ids)
-
-                # Store for batch creation
-                branched_batches.append({
-                    "input_ids": truncated_input_ids.unsqueeze(0),
-                    "attention_mask": truncated_attention_mask.unsqueeze(0),
-                })
-
-            # Create a new DataProto for branched generation
-            # Need to pad sequences to the same length before concatenating
-            max_length = max(b["input_ids"].shape[1] for b in branched_batches)
-
-            # Pad all sequences to max_length
-            padded_input_ids = []
-            padded_attention_mask = []
-            
-            # Use tokenizer's pad token id (fallback to eos if pad is None)
-            pad_id = self.tokenizer.pad_token_id
-            if pad_id is None:
-                pad_id = self.tokenizer.eos_token_id
-
-            for b in branched_batches:
-                seq_len = b["input_ids"].shape[1]
-                if seq_len < max_length:
-                    # Pad on the right (typical for generation)
-                    padding_length = max_length - seq_len
-                    # Use 0 as padding token (will be masked out by attention_mask)
-                    padded_ids = torch.cat([
-                        b["input_ids"],
-                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device)
-                    ], dim=1)
-                    padded_mask = torch.cat([
-                        b["attention_mask"],
-                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device)
-                    ], dim=1)
-                else:
-                    padded_ids = b["input_ids"]
-                    padded_mask = b["attention_mask"]
-
-                padded_input_ids.append(padded_ids)
-                padded_attention_mask.append(padded_mask)
-
-            branched_input_ids = torch.cat(padded_input_ids, dim=0)
-            branched_attention_mask = torch.cat(padded_attention_mask, dim=0)
-
-            # Ensure proper dtype for token IDs
-            if branched_input_ids.dtype != torch.long:
-                branched_input_ids = branched_input_ids.long()
-
-            # Compute and include position_ids for branched generation
-            from verl.utils.model import compute_position_id_with_mask
-            branched_position_ids = compute_position_id_with_mask(branched_attention_mask)
-
-            branched_gen_batch = DataProto.from_dict(
-                tensors={
-                    "input_ids": branched_input_ids,
-                    "attention_mask": branched_attention_mask,
-                    "position_ids": branched_position_ids,
-                },
-                non_tensors=gen_batch_output.non_tensor_batch.copy(),
-                meta_info=gen_batch_output.meta_info.copy(),
-            )
-
-            # Generate continuations from branch points
-            with marked_timer("gen_branched", timing_raw, color="purple"):
-                if not self.async_rollout_mode:
-                    branched_output = self.actor_rollout_wg.generate_sequences(branched_gen_batch)
-                else:
-                    branched_output = self.async_rollout_manager.generate_sequences(branched_gen_batch)
-                timing_raw.update(branched_output.meta_info.get("timing", {}))
-                branched_output.meta_info.pop("timing", None)
-
-            # Combine original and branched rollouts
-            # We need to merge the batches such that they can be processed together
-            combined_tensors = {}
-            combined_non_tensors = {}
-
-            # Merge batch tensors
-            for key in gen_batch_output.batch.keys():
-                if key in branched_output.batch:
-                    # Check if tensors need padding (different sequence lengths)
-                    orig_tensor = gen_batch_output.batch[key]
-                    branch_tensor = branched_output.batch[key]
-
-                    # Only pad if we have 2D+ tensors with potential length mismatch
-                    if len(orig_tensor.shape) >= 2 and orig_tensor.shape[1] != branch_tensor.shape[1]:
-                        max_seq_len = max(orig_tensor.shape[1], branch_tensor.shape[1])
-
-                        # Pad original tensor if needed
-                        if orig_tensor.shape[1] < max_seq_len:
-                            pad_len = max_seq_len - orig_tensor.shape[1]
-                            pad_shape = list(orig_tensor.shape)
-                            pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=orig_tensor.dtype, device=orig_tensor.device)
-                            orig_tensor = torch.cat([orig_tensor, padding], dim=1)
-
-                        # Pad branched tensor if needed
-                        if branch_tensor.shape[1] < max_seq_len:
-                            pad_len = max_seq_len - branch_tensor.shape[1]
-                            pad_shape = list(branch_tensor.shape)
-                            pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=branch_tensor.dtype, device=branch_tensor.device)
-                            branch_tensor = torch.cat([branch_tensor, padding], dim=1)
-
-                        combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
-                    else:
-                        # No padding needed, concatenate directly
-                        combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
-                else:
-                    # If key only in original, duplicate it
-                    combined_tensors[key] = gen_batch_output.batch[key].repeat(2, *([1] * (len(gen_batch_output.batch[key].shape) - 1)))
-
-            # Merge non-tensor batch
-            for key in gen_batch_output.non_tensor_batch.keys():
-                if key in branched_output.non_tensor_batch:
-                    if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
-                        combined_non_tensors[key] = np.concatenate([
-                            gen_batch_output.non_tensor_batch[key],
-                            branched_output.non_tensor_batch[key]
-                        ])
-                    else:
-                        combined_non_tensors[key] = (
-                            gen_batch_output.non_tensor_batch[key] +
-                            branched_output.non_tensor_batch[key]
-                        )
-                else:
-                    # Duplicate non-tensor entries
-                    if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
-                        combined_non_tensors[key] = np.tile(
-                            gen_batch_output.non_tensor_batch[key], 2
-                        )
-                    else:
-                        combined_non_tensors[key] = (
-                            gen_batch_output.non_tensor_batch[key] * 2
-                        )
-
-            # Create DataProto from the combined dictionaries
-            combined_batch = DataProto.from_dict(
-                tensors=combined_tensors,
-                non_tensors=combined_non_tensors,
-                meta_info=gen_batch_output.meta_info.copy(),
-            )
-
-            return combined_batch
-
     def fit(self):
         """
         The training loop of PPO.
@@ -1240,15 +1005,6 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    # Apply trajectory branching if enabled
-                    enable_branching = self.config.actor_rollout_ref.rollout.get("enable_trajectory_branching", False)
-                    if enable_branching:
-                        # Store original batch before repeating for branching function
-                        original_batch_for_branching = batch
-                        gen_batch_output = self._create_branched_rollouts(
-                            original_batch_for_branching, gen_batch_output, timing_raw
-                        )
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1271,11 +1027,7 @@ class RayPPOTrainer:
                             del gen_baseline_batch, gen_baseline_output
 
                     # repeat to align with repeated responses in rollout
-                    # If branching is enabled, we have 2n rollouts, otherwise n
-                    repeat_factor = self.config.actor_rollout_ref.rollout.n
-                    if enable_branching:
-                        repeat_factor *= 2
-                    batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1472,10 +1224,6 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # # Collect timestamp information from timing data
-                # from verl.trainer.ppo.metric_utils import collect_training_timestamps
-                # timestamp_raw = collect_training_timestamps(timing_raw)
-                # metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw, timestamp_raw=timestamp_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
