@@ -145,6 +145,7 @@ class RolloutConfig(BaseConfig):
     tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
+    enable_trajectory_branching: bool = False
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
