@@ -929,17 +929,9 @@ class RayPPOTrainer:
             # Extract necessary data
             responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
             attention_mask = gen_batch_output.batch.get("attention_mask")
-            
-            # Get valid vocabulary range to filter out invalid tokens
-            try:
-                tokenizer_size = len(self.tokenizer)
-            except Exception:
-                tokenizer_size = None
-            vocab_size_prop = getattr(self.tokenizer, "vocab_size", None)
-            valid_vocab_size = None
-            for v in (tokenizer_size, vocab_size_prop):
-                if isinstance(v, int) and v > 0:
-                    valid_vocab_size = v if valid_vocab_size is None else max(valid_vocab_size, v)
+                
+            # Get max token id to filter out invalid tokens
+            max_token_id = self.tokenizer.vocab_size - 1
 
             # Get the original input_ids from gen_batch_output or reconstruct
             # The generated batch should have the full sequence (input + response)
@@ -980,20 +972,28 @@ class RayPPOTrainer:
                     branch_point = valid_positions[branch_point_idx].item() + 1  # +1 to include selected token
 
                 # Create new input that includes the truncated response
+                truncated_response = responses[idx, :branch_point]
+                valid_mask = (truncated_response < max_token_id) & (truncated_response != self.tokenizer.pad_token_id)
+                if valid_mask.any():
+                        first_invalid = valid_mask.size(0) if valid_mask.all() else (valid_mask == False).nonzero(as_tuple=True)[0][0]
+                        truncated_response = truncated_response[:first_invalid]
+
                 if "input_ids" in gen_batch_output.batch:
                     # We have full input_ids, truncate the response part
                     prompt_length = full_input_ids.shape[1] - response_length
+                    # truncated_input_ids = full_input_ids[idx, :prompt_length]
                     truncated_input_ids = torch.cat([
                         full_input_ids[idx, :prompt_length],  # Original prompt
-                        responses[idx, :branch_point]  # Truncated response
+                        truncated_response  # Truncated response
                     ], dim=0)
                 else:
                     # Reconstruct from original batch
                     n_rollouts = self.config.actor_rollout_ref.rollout.n
                     original_idx = idx // n_rollouts
+                    # truncated_input_ids = original_batch.batch["input_ids"][original_idx]
                     truncated_input_ids = torch.cat([
                         original_batch.batch["input_ids"][original_idx],
-                        responses[idx, :branch_point]
+                        truncated_response
                     ], dim=0)
 
                 # Create attention mask for the truncated input
@@ -1084,13 +1084,21 @@ class RayPPOTrainer:
                     # Only pad if we have 2D+ tensors with potential length mismatch
                     if len(orig_tensor.shape) >= 2 and orig_tensor.shape[1] != branch_tensor.shape[1]:
                         max_seq_len = max(orig_tensor.shape[1], branch_tensor.shape[1])
+                        
+                        # Determine the appropriate padding value based on the key
+                        if key == "attention_mask":
+                            pad_value = 0  # Attention masks should be padded with 0
+                        elif key in ["input_ids", "prompts", "responses"]:
+                            pad_value = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                        else:
+                            pad_value = 0  # Default to 0 for other tensors
 
                         # Pad original tensor if needed
                         if orig_tensor.shape[1] < max_seq_len:
                             pad_len = max_seq_len - orig_tensor.shape[1]
                             pad_shape = list(orig_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=orig_tensor.dtype, device=orig_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=orig_tensor.dtype, device=orig_tensor.device)
                             orig_tensor = torch.cat([orig_tensor, padding], dim=1)
 
                         # Pad branched tensor if needed
@@ -1098,7 +1106,7 @@ class RayPPOTrainer:
                             pad_len = max_seq_len - branch_tensor.shape[1]
                             pad_shape = list(branch_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=branch_tensor.dtype, device=branch_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=branch_tensor.dtype, device=branch_tensor.device)
                             branch_tensor = torch.cat([branch_tensor, padding], dim=1)
 
                         combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
