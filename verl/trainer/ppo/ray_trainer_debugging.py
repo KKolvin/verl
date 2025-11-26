@@ -905,7 +905,6 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-    
 
     def _create_branched_rollouts(
         self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict
@@ -929,9 +928,6 @@ class RayPPOTrainer:
             # Extract necessary data
             responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
             attention_mask = gen_batch_output.batch.get("attention_mask")
-                
-            # Get max token id to filter out invalid tokens
-            max_token_id = self.tokenizer.vocab_size - 1
 
             # Get the original input_ids from gen_batch_output or reconstruct
             # The generated batch should have the full sequence (input + response)
@@ -951,45 +947,41 @@ class RayPPOTrainer:
             branched_batches = []
 
             for idx in range(batch_size):
+                # Get the current response
                 current_response = responses[idx]
-                valid_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
-                if valid_mask.any():
-                        first_invalid = valid_mask.size(0) if valid_mask.all() else (valid_mask == False).nonzero(as_tuple=True)[0][0]
-                        current_response = current_response[:first_invalid]
-                current_response_length = len(current_response)
-                
+
                 # Find valid positions (non-padding tokens)
                 if attention_mask is not None:
-                    response_mask = attention_mask[idx, -current_response_length:]
+                    response_mask = attention_mask[idx, -response_length:]
                     valid_positions = torch.where(response_mask > 0)[0]
                 else:
                     # If no mask, assume all positions are valid
-                    valid_positions = torch.arange(current_response_length, device=responses.device)
+                    valid_positions = torch.arange(response_length, device=responses.device)
 
                 # Skip if response is too short (need at least 2 valid tokens to branch)
                 if len(valid_positions) < 2:
-                    branch_point = current_response_length
+                    # If too short, use the full response as branch point (essentially duplicate)
+                    branch_point = response_length
                 else:
                     # Randomly select a branch point (excluding the last token to allow continuation)
                     branch_point_idx = random.randint(0, len(valid_positions) - 2)
                     branch_point = valid_positions[branch_point_idx].item() + 1  # +1 to include selected token
 
+                # Create new input that includes the truncated response
                 if "input_ids" in gen_batch_output.batch:
                     # We have full input_ids, truncate the response part
                     prompt_length = full_input_ids.shape[1] - response_length
-                    # truncated_input_ids = full_input_ids[idx, :prompt_length]
                     truncated_input_ids = torch.cat([
                         full_input_ids[idx, :prompt_length],  # Original prompt
-                        current_response[:branch_point]  # Truncated response
+                        responses[idx, :branch_point]  # Truncated response
                     ], dim=0)
                 else:
                     # Reconstruct from original batch
                     n_rollouts = self.config.actor_rollout_ref.rollout.n
                     original_idx = idx // n_rollouts
-                    # truncated_input_ids = original_batch.batch["input_ids"][original_idx]
                     truncated_input_ids = torch.cat([
                         original_batch.batch["input_ids"][original_idx],
-                        current_response[:branch_point]
+                        responses[idx, :branch_point]
                     ], dim=0)
 
                 # Create attention mask for the truncated input
@@ -1080,21 +1072,13 @@ class RayPPOTrainer:
                     # Only pad if we have 2D+ tensors with potential length mismatch
                     if len(orig_tensor.shape) >= 2 and orig_tensor.shape[1] != branch_tensor.shape[1]:
                         max_seq_len = max(orig_tensor.shape[1], branch_tensor.shape[1])
-                        
-                        # Determine the appropriate padding value based on the key
-                        if key == "attention_mask":
-                            pad_value = 0  # Attention masks should be padded with 0
-                        elif key in ["input_ids", "prompts", "responses"]:
-                            pad_value = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                        else:
-                            pad_value = 0  # Default to 0 for other tensors
 
                         # Pad original tensor if needed
                         if orig_tensor.shape[1] < max_seq_len:
                             pad_len = max_seq_len - orig_tensor.shape[1]
                             pad_shape = list(orig_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=orig_tensor.dtype, device=orig_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=orig_tensor.dtype, device=orig_tensor.device)
                             orig_tensor = torch.cat([orig_tensor, padding], dim=1)
 
                         # Pad branched tensor if needed
@@ -1102,7 +1086,7 @@ class RayPPOTrainer:
                             pad_len = max_seq_len - branch_tensor.shape[1]
                             pad_shape = list(branch_tensor.shape)
                             pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=branch_tensor.dtype, device=branch_tensor.device)
+                            padding = torch.full(pad_shape, fill_value=self.tokenizer.pad_token_id, dtype=branch_tensor.dtype, device=branch_tensor.device)
                             branch_tensor = torch.cat([branch_tensor, padding], dim=1)
 
                         combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
@@ -1245,6 +1229,7 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # Apply trajectory branching if enabled
                     enable_branching = self.config.actor_rollout_ref.rollout.get("enable_trajectory_branching", False)
                     if enable_branching:
                         # Store original batch before repeating for branching function
@@ -1275,6 +1260,7 @@ class RayPPOTrainer:
                             del gen_baseline_batch, gen_baseline_output
 
                     # repeat to align with repeated responses in rollout
+                    # If branching is enabled, we have 2n rollouts, otherwise n
                     repeat_factor = self.config.actor_rollout_ref.rollout.n
                     if enable_branching:
                         repeat_factor *= 2
@@ -1475,6 +1461,10 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # # Collect timestamp information from timing data
+                # from verl.trainer.ppo.metric_utils import collect_training_timestamps
+                # timestamp_raw = collect_training_timestamps(timing_raw)
+                # metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw, timestamp_raw=timestamp_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
