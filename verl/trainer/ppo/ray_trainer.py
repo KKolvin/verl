@@ -968,18 +968,10 @@ class RayPPOTrainer:
 
                 # Skip if response is too short (need at least 2 valid tokens to branch)
                 if len(valid_positions) < 2:
-                    branch_point = current_response_length
+                    branch_point = valid_positions[-1].item() + 1
                 else:
                     # Randomly select a branch point (excluding the last token to allow continuation)
-                    branch_point_idx = random.randint(0, current_response_length - 2)
-                    branch_point = valid_positions[branch_point_idx].item() + 1  # +1 to include selected token
-
-                # # Create new input that includes the truncated response
-                # truncated_response = responses[idx, :branch_point]
-                # valid_mask = (truncated_response < max_token_id) & (truncated_response != self.tokenizer.pad_token_id)
-                # if valid_mask.any():
-                #         first_invalid = valid_mask.size(0) if valid_mask.all() else (valid_mask == False).nonzero(as_tuple=True)[0][0]
-                #         truncated_response = truncated_response[:first_invalid]
+                    branch_point = valid_positions[random.randint(0, len(valid_positions) - 2)].item() + 1  # +1 to include selected token
 
                 if "input_ids" in gen_batch_output.batch:
                     # We have full input_ids, truncate the response part
