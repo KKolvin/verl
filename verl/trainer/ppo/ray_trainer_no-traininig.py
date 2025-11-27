@@ -950,30 +950,51 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
-
             for idx in range(batch_size):
-                current_response = responses[idx] 
-                valid_response_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
-                valid_indices = torch.where(valid_response_mask)[0]
-
-                prompt_length = full_input_ids.shape[1] - response_length
-                response_start = prompt_length
-                response_length = len(valid_indices)
-                response_end = response_start + response_length - 1
-                print(f"==================== View response {idx} ====================\n"
-                      f"response length: {len(current_response)}, \n"
-                      f"valid length: {len(valid_indices)}, \n"
-                      f"original response decoded: {self.tokenizer.decode(responses[idx], skip_special_tokens=False)}, \n"
-                      f"valid response decoded: {self.tokenizer.decode(responses[idx][valid_response_mask], skip_special_tokens=False)}\n"
-                      f"=============================================================\n\n")
-
-                if response_length <= 2:
-                    branch_point = response_end
-                else:
-                    branch_point = random.randint(response_start, response_end - 2)
+                current_response = responses[idx]
+                valid_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
+                if valid_mask.any():
+                        first_invalid = valid_mask.size(0) if valid_mask.all() else (valid_mask == False).nonzero(as_tuple=True)[0][0]
+                        current_response = current_response[:first_invalid]
+                current_response_length = len(current_response)
                 
-                truncated_input_ids = full_input_ids[idx, :branch_point + 1]
-                truncated_attention_mask = attention_mask[idx, :branch_point + 1]
+                # Find valid positions (non-padding tokens)
+                if attention_mask is not None:
+                    response_mask = attention_mask[idx, -current_response_length:]
+                    valid_positions = torch.where(response_mask > 0)[0]
+                else:
+                    # If no mask, assume all positions are valid
+                    valid_positions = torch.arange(current_response_length, device=responses.device)
+
+                # Skip if response is too short (need at least 2 valid tokens to branch)
+                if len(valid_positions) < 2 or current_response_length < 2:
+                    branch_point = current_response_length
+                else:
+                    # Randomly select a branch point (excluding the last token to allow continuation)
+                    branch_point_idx = random.randint(0, current_response_length - 2)
+                    branch_point_idx = len(valid_positions) - 2 if branch_point_idx >= len(valid_positions) else branch_point_idx
+                    branch_point = valid_positions[branch_point_idx].item() + 1  # +1 to include selected token
+
+                if "input_ids" in gen_batch_output.batch:
+                    # We have full input_ids, truncate the response part
+                    prompt_length = full_input_ids.shape[1] - response_length
+                    # truncated_input_ids = full_input_ids[idx, :prompt_length]
+                    truncated_input_ids = torch.cat([
+                        full_input_ids[idx, :prompt_length],  # Original prompt
+                        current_response[:branch_point]  # Truncated response
+                    ], dim=0)
+                else:
+                    # Reconstruct from original batch
+                    n_rollouts = self.config.actor_rollout_ref.rollout.n
+                    original_idx = idx // n_rollouts
+                    # truncated_input_ids = original_batch.batch["input_ids"][original_idx]
+                    truncated_input_ids = torch.cat([
+                        original_batch.batch["input_ids"][original_idx],
+                        current_response[:branch_point]
+                    ], dim=0)
+
+                # Create attention mask for the truncated input
+                truncated_attention_mask = torch.ones_like(truncated_input_ids)
 
                 # Store for batch creation
                 branched_batches.append({
