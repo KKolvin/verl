@@ -950,6 +950,7 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
+            min_remaining_response_budget = float('inf')
             for idx in range(batch_size):
                 prompt_length = full_input_ids.shape[1] - response_length
                 valid_prompt_start = attention_mask[idx].argmax().item()
@@ -967,6 +968,8 @@ class RayPPOTrainer:
                     branch_point = valid_response_length
                 else:
                     branch_point = random.randint(0, valid_response_length - 1)
+
+                min_remaining_response_budget = min(min_remaining_response_budget, response_length - branch_point - 1)
 
                 truncated_input_ids = torch.cat([
                     valid_prompt,
@@ -1047,8 +1050,14 @@ class RayPPOTrainer:
                     "attention_mask": branched_attention_mask,
                     "position_ids": branched_position_ids,
                 },
-                non_tensors=gen_batch_output.non_tensor_batch.copy(),
-                meta_info=gen_batch_output.meta_info.copy(),
+                non_tensors={
+                    **gen_batch_output.non_tensor_batch,
+                    "remaining_response_budget": min_remaining_response_budget,
+                },
+                meta_info={
+                    **gen_batch_output.meta_info,
+                    "is_branched": True,
+                }
             )
 
             # Generate continuations from branch points

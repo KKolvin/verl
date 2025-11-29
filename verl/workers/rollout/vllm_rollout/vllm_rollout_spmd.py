@@ -279,6 +279,14 @@ class vLLMRollout(BaseRollout):
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
+        # For branched rollouts, optionally cap the max number of generated tokens
+        # by the remaining response budget passed from the trainer.
+        max_tokens_override = None
+        if prompts.meta_info.get("is_branched", False):
+            remaining_response_budget = non_tensor_batch.get("remaining_response_budget", None)
+            if remaining_response_budget is not None:
+                max_tokens_override = min(int(remaining_response_budget), self.config.response_length)
+
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(
@@ -318,6 +326,11 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+
+        # If this batch comes from branched generation and we have a remaining
+        # response budget, override the max_tokens used by vLLM.
+        if max_tokens_override is not None:
+            kwargs["max_tokens"] = max_tokens_override
 
         lora_requests = None
         if self.lora_kwargs:
