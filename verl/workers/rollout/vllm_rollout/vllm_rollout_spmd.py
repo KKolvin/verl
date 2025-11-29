@@ -282,10 +282,9 @@ class vLLMRollout(BaseRollout):
         # For branched rollouts, optionally cap the max number of generated tokens
         # by the remaining response budget passed from the trainer.
         max_tokens_override = None
-        if prompts.meta_info.get("is_branched", False):
-            remaining_response_budget = non_tensor_batch.get("remaining_response_budget", None)
-            if remaining_response_budget is not None:
-                max_tokens_override = min(int(remaining_response_budget), self.config.response_length)
+        remaining_response_budget = prompts.meta_info.get("remaining_response_budget", None)
+        if prompts.meta_info.get("is_branched", False) and remaining_response_budget is not None:
+            max_tokens_override = min(int(remaining_response_budget), self.config.response_length)
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []

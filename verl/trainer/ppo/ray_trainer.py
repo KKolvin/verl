@@ -1050,13 +1050,11 @@ class RayPPOTrainer:
                     "attention_mask": branched_attention_mask,
                     "position_ids": branched_position_ids,
                 },
-                non_tensors={
-                    **gen_batch_output.non_tensor_batch,
-                    "remaining_response_budget": min_remaining_response_budget,
-                },
+                non_tensors=gen_batch_output.non_tensor_batch.copy(),
                 meta_info={
                     **gen_batch_output.meta_info,
                     "is_branched": True,
+                    "remaining_response_budget": min_remaining_response_budget,
                 }
             )
 
