@@ -950,7 +950,7 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
-            min_remaining_response_budget = float('inf')
+            min_branch_point = response_length
             for idx in range(batch_size):
                 prompt_length = full_input_ids.shape[1] - response_length
                 valid_prompt_start = attention_mask[idx].argmax().item()
@@ -969,7 +969,7 @@ class RayPPOTrainer:
                 else:
                     branch_point = random.randint(0, valid_response_length - 1)
 
-                min_remaining_response_budget = min(min_remaining_response_budget, response_length - branch_point - 1)
+                min_branch_point = min(min_branch_point, branch_point)
 
                 truncated_input_ids = torch.cat([
                     valid_prompt,
@@ -1054,7 +1054,7 @@ class RayPPOTrainer:
                 meta_info={
                     **gen_batch_output.meta_info,
                     "is_branched": True,
-                    "remaining_response_budget": min_remaining_response_budget,
+                    "remaining_response_budget": response_length - min_branch_point - 1,
                 }
             )
 
