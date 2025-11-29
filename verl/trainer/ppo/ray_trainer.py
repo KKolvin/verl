@@ -1229,6 +1229,14 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # Cache ground truths once so that all rollouts (including branched ones)
+                # share the same gts label when dumping generations.
+                if "reward_model" in batch.non_tensor_batch:
+                    rm_arr = batch.non_tensor_batch["reward_model"]
+                    # rm_arr can be a NumPy array or list of dicts
+                    ground_truths = [item.get("ground_truth", None) for item in rm_arr]
+                    batch.non_tensor_batch["gts"] = np.array(ground_truths, dtype=object)
+
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -1398,10 +1406,17 @@ class RayPPOTrainer:
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            sample_gts = [
-                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-                                for item in batch
-                            ]
+
+                            # Prefer cached gts so that branched and non-branched rollouts
+                            # for the same original example share identical labels.
+                            if "gts" in batch.non_tensor_batch:
+                                sample_gts = batch.non_tensor_batch["gts"].tolist()
+                            else:
+                                # Fallback for older runs or configs without cached gts
+                                sample_gts = [
+                                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                    for item in batch
+                                ]
 
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
