@@ -950,36 +950,43 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
-
             for idx in range(batch_size):
-                current_response = responses[idx] 
-                valid_response_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
-                valid_indices = torch.where(valid_response_mask)[0]
-
                 prompt_length = full_input_ids.shape[1] - response_length
-                response_start = prompt_length
-                response_length = len(valid_indices)
-                response_end = response_start + response_length - 1
-                print(f"==================== View response {idx} ====================\n"
-                      f"response length: {len(current_response)}, \n"
-                      f"valid length: {len(valid_indices)}, \n"
-                      f"original response decoded: {self.tokenizer.decode(responses[idx], skip_special_tokens=False)}, \n"
-                      f"valid response decoded: {self.tokenizer.decode(responses[idx][valid_response_mask], skip_special_tokens=False)}\n"
-                      f"=============================================================\n\n")
+                valid_prompt_start = attention_mask[idx].argmax().item()
+                valid_prompt = full_input_ids[idx, valid_prompt_start:prompt_length]
 
-                if response_length <= 2:
-                    branch_point = response_end
+                current_response = responses[idx]
+                valid_response_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
+                # valid_response_ids = torch.where(valid_response_mask)[0]
+                if valid_response_mask.any():
+                        first_invalid_response = valid_response_mask.size(0) if valid_response_mask.all() else (valid_response_mask == False).nonzero(as_tuple=True)[0][0]
+                        current_response = current_response[:first_invalid_response]
+                valid_response_length = len(current_response)
+
+                if valid_response_length <= 2:
+                    branch_point = valid_response_length
                 else:
-                    branch_point = random.randint(response_start, response_end - 2)
-                
-                truncated_input_ids = full_input_ids[idx, :branch_point + 1]
-                truncated_attention_mask = attention_mask[idx, :branch_point + 1]
+                    branch_point = random.randint(0, valid_response_length - 1)
+
+                truncated_input_ids = torch.cat([
+                    valid_prompt,
+                    current_response[:branch_point]
+                ], dim=0)
+                truncated_attention_mask = torch.ones_like(truncated_input_ids)
 
                 # Store for batch creation
                 branched_batches.append({
                     "input_ids": truncated_input_ids.unsqueeze(0),
                     "attention_mask": truncated_attention_mask.unsqueeze(0),
                 })
+                # print(f"==================== DEBUG: View response {idx} ====================\n"
+                #       f"Valid prompt length: {prompt_length - valid_prompt_start}\n"
+                #       f"Valid prompt decoded: {self.tokenizer.decode(full_input_ids[idx][valid_prompt_start:prompt_length], skip_special_tokens=False)}"
+                #       f"Valid response length: {valid_response_length}, branch point: {branch_point}\n"
+                #       f"Valid response decoded: {self.tokenizer.decode(current_response[:valid_response_length], skip_special_tokens=False)}\n"
+                #       f"Branched input decoded: {self.tokenizer.decode(truncated_input_ids, skip_special_tokens=False)}\n"
+                #       f"Branched input length: {len(truncated_input_ids)}\n"
+                #      f"==========================================================================\n\n")
 
             # Create a new DataProto for branched generation
             # Need to pad sequences to the same length before concatenating
@@ -997,16 +1004,17 @@ class RayPPOTrainer:
             for b in branched_batches:
                 seq_len = b["input_ids"].shape[1]
                 if seq_len < max_length:
-                    # Pad on the right (typical for generation)
+                    # Pad on the left (for decoder-only models)
                     padding_length = max_length - seq_len
-                    # Use 0 as padding token (will be masked out by attention_mask)
+                    # Left pad with pad_id
                     padded_ids = torch.cat([
-                        b["input_ids"],
-                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device)
+                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device),
+                        b["input_ids"]
                     ], dim=1)
+                    # Left pad attention mask with zeros (padding tokens should not be attended to)
                     padded_mask = torch.cat([
-                        b["attention_mask"],
-                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device)
+                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device),
+                        b["attention_mask"]
                     ], dim=1)
                 else:
                     padded_ids = b["input_ids"]
@@ -1014,6 +1022,13 @@ class RayPPOTrainer:
 
                 padded_input_ids.append(padded_ids)
                 padded_attention_mask.append(padded_mask)
+
+                # print(f"==================== DEBUG: View padded sequence {idx} ====================")
+                # print(f"Max sequence length: {max_length}\n"
+                #       f"Sequence length: {seq_len}\n"
+                #       f"Sequence decoded: \n{self.tokenizer.decode(b['input_ids'][0], skip_special_tokens=False)}\n"
+                #       f"Padded attention mask: {padded_mask}\n"
+                #       f"==========================================================================\n\n")
 
             branched_input_ids = torch.cat(padded_input_ids, dim=0)
             branched_attention_mask = torch.cat(padded_attention_mask, dim=0)
