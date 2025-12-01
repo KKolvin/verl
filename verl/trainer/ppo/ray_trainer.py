@@ -949,6 +949,7 @@ class RayPPOTrainer:
 
             # Create branched rollouts
             branched_batches = []
+            branch_points_list = []  # Store branch points for masking prefix tokens later
 
             min_branch_point = response_length
             for idx in range(batch_size):
@@ -964,12 +965,13 @@ class RayPPOTrainer:
                         current_response = current_response[:first_invalid_response]
                 valid_response_length = len(current_response)
 
-                if valid_response_length <= 2:
-                    branch_point = valid_response_length
+                if valid_response_length <= 5:
+                    branch_point = max(0, valid_response_length // 2)
                 else:
-                    branch_point = random.randint(0, valid_response_length - 1)
+                    branch_point = random.randint(0, valid_response_length - 4)
 
                 min_branch_point = min(min_branch_point, branch_point)
+                branch_points_list.append(branch_point)  # Store for prefix masking
 
                 truncated_input_ids = torch.cat([
                     valid_prompt,
@@ -1140,10 +1142,15 @@ class RayPPOTrainer:
                         )
 
             # Create DataProto from the combined dictionaries
+            combined_meta_info = gen_batch_output.meta_info.copy()
+            # Store branch points for masking prefix tokens in policy gradient
+            # branch_points_list has length = n_original, one branch point per branched sample
+            combined_meta_info["branch_points"] = branch_points_list
+            
             combined_batch = DataProto.from_dict(
                 tensors=combined_tensors,
                 non_tensors=combined_non_tensors,
-                meta_info=gen_batch_output.meta_info.copy(),
+                meta_info=combined_meta_info,
             )
 
             return combined_batch
@@ -1263,7 +1270,7 @@ class RayPPOTrainer:
                             original_batch_for_branching, gen_batch_output, timing_raw
                         )
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX: 
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -1284,15 +1291,82 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # repeat to align with repeated responses in rollout
-                    repeat_factor = self.config.actor_rollout_ref.rollout.n
+                    #   - Without branching: we keep the original behavior, repeating the
+                    #     whole batch `n` times and then union'ing the generated tensors.
+                    #   - With branching enabled: `gen_batch_output` already contains both
+                    #     original and branched rollouts (2n per example), so we rebuild
+                    #     a new DataProto whose tensors come from `gen_batch_output` and
+                    #     whose non-tensor metadata (e.g., reward_model, data_source, uid)
+                    #     are expanded to length 2n per original example. This avoids
+                    #     misalignment between prompts/responses and ground-truth labels.
+                    n_rollouts = self.config.actor_rollout_ref.rollout.n
                     if enable_branching:
-                        repeat_factor *= 2
-                    batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        # Original batch size before any rollout repetition
+                        base_batch_size = len(batch)
+
+                        expanded_non_tensors: dict[str, np.ndarray] = {}
+                        for key, val in batch.non_tensor_batch.items():
+                            # Only expand along the first dimension if it matches the base
+                            # batch size; leave other metadata (e.g., scalars) untouched.
+                            if isinstance(val, np.ndarray) and val.shape[0] == base_batch_size:
+                                # First repeat per rollout, then duplicate for branched and
+                                # non-branched rollouts: shape becomes (base_batch_size * 2n, ...)
+                                repeated = np.repeat(val, n_rollouts, axis=0)
+                                
+                                # Fix 2: Create separate UIDs for branched rollouts
+                                # This prevents GRPO from grouping original and branched responses
+                                # together, which would create unfair advantage comparisons between
+                                # causally-dependent samples (branched shares prefix with original).
+                                if key == "uid":
+                                    branched_uids = np.array(
+                                        [str(uuid.uuid4()) for _ in range(len(repeated))], dtype=object
+                                    )
+                                    expanded_non_tensors[key] = np.concatenate([repeated, branched_uids], axis=0)
+                                else:
+                                    expanded_non_tensors[key] = np.concatenate([repeated, repeated], axis=0)
+                            else:
+                                expanded_non_tensors[key] = val
+                        
+                        # Merge rollout-specific non-tensors from gen_batch_output
+                        # (e.g., cached gts) which already have the correct length
+                        # and ordering matching `gen_batch_output.batch`.
+                        for key, val in gen_batch_output.non_tensor_batch.items():
+                            expanded_non_tensors[key] = val
+
+                        # Rebuild `batch` so that:
+                        #   - tensors (prompts, responses, attention_mask, etc.) come
+                        #     directly from the combined generation outputs
+                        #   - non-tensors (reward_model, data_source, gts, uid, ...) are
+                        #     aligned 1:1 with those tensors
+                        batch = DataProto(
+                            batch=gen_batch_output.batch,
+                            non_tensor_batch=expanded_non_tensors,
+                            meta_info=gen_batch_output.meta_info.copy(),
+                        )
+                    else:
+                        # Original (non-branching) behavior: repeat to align with n rollouts
+                        repeat_factor = n_rollouts
+                        batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    
+                    # Fix 1: Mask prefix tokens for branched samples to prevent conflicting gradients
+                    # Branched samples share prefix tokens with originals, which would receive
+                    # conflicting gradient signals (same tokens, different advantages). We zero
+                    # out the prefix portion so only post-branch tokens contribute to policy gradient.
+                    if enable_branching and "branch_points" in batch.meta_info:
+                        branch_points = batch.meta_info["branch_points"]
+                        total_samples = batch.batch["response_mask"].shape[0]
+                        n_original = total_samples // 2  # First half are originals, second half are branched
+                        
+                        for i, branch_point in enumerate(branch_points):
+                            branched_idx = n_original + i  # Branched samples are in second half
+                            if branched_idx < total_samples and branch_point > 0:
+                                # Zero out prefix tokens (positions 0 to branch_point-1)
+                                batch.batch["response_mask"][branched_idx, :branch_point] = 0
+                    
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

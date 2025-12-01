@@ -950,68 +950,31 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
+            min_branch_point = response_length
             for idx in range(batch_size):
+                prompt_length = full_input_ids.shape[1] - response_length
+                valid_prompt_start = attention_mask[idx].argmax().item()
+                valid_prompt = full_input_ids[idx, valid_prompt_start:prompt_length]
+
                 current_response = responses[idx]
-                valid_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
-                if valid_mask.any():
-                        first_invalid = valid_mask.size(0) if valid_mask.all() else (valid_mask == False).nonzero(as_tuple=True)[0][0]
-                        current_response = current_response[:first_invalid]
-                current_response_length = len(current_response)
-                
-                # Find valid positions (non-padding tokens)
-                if attention_mask is not None:
-                    response_mask = attention_mask[idx, -current_response_length:]
-                    valid_positions = torch.where(response_mask > 0)[0]
-                else:
-                    # If no mask, assume all positions are valid
-                    valid_positions = torch.arange(current_response_length, device=responses.device)
-                
-                # Debug: Print response when current_response_length is 0 OR valid_positions is empty
-                if current_response_length == 0 or len(valid_positions) == 0:
-                    print(f"\n=== INVALID RESPONSE at idx={idx} ===")
-                    print(f"Prompt: {self.tokenizer.decode(full_input_ids[idx], skip_special_tokens=False)}")
-                    print(f"Original response: {self.tokenizer.decode(responses[idx], skip_special_tokens=False)}")
-                    print(f"truncated response length: {current_response_length}")
-                    print(f"len(valid_positions): {len(valid_positions)}")
-                    print(f"Valid mask: {valid_mask}")
-                    print(f"Attention mask shape: {attention_mask[idx].shape if attention_mask is not None else 'None'}")
-                    if attention_mask is not None:
-                        print(f"Attention mask: {attention_mask[idx]}")
-                        if current_response_length > 0:
-                            print(f"Response attention mask: {attention_mask[idx, -current_response_length:]}")
-                    print("=" * 50)
+                valid_response_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
+                # valid_response_ids = torch.where(valid_response_mask)[0]
+                if valid_response_mask.any():
+                        first_invalid_response = valid_response_mask.size(0) if valid_response_mask.all() else (valid_response_mask == False).nonzero(as_tuple=True)[0][0]
+                        current_response = current_response[:first_invalid_response]
+                valid_response_length = len(current_response)
 
-                # Skip if response is too short (need at least 2 valid tokens to branch)
-                if len(valid_positions) < 2:
-                    branch_point = current_response_length
+                if valid_response_length <= 5:
+                    branch_point = max(0, valid_response_length // 2)
                 else:
-                    # Randomly select a branch point (excluding the last token to allow continuation)
-                    if current_response_length < 2:
-                        branch_point_idx = random.randint(0, len(valid_positions) - 2)
-                        branch_point = valid_positions[branch_point_idx].item() + 1
-                    else:
-                        branch_point = random.randint(0, current_response_length - 2)
-                    
+                    branch_point = random.randint(0, valid_response_length - 4)
 
-                if "input_ids" in gen_batch_output.batch:
-                    # We have full input_ids, truncate the response part
-                    prompt_length = full_input_ids.shape[1] - response_length
-                    # truncated_input_ids = full_input_ids[idx, :prompt_length]
-                    truncated_input_ids = torch.cat([
-                        full_input_ids[idx, :prompt_length],  # Original prompt
-                        responses[idx, :branch_point]  # Truncated response
-                    ], dim=0)
-                else:
-                    # Reconstruct from original batch
-                    n_rollouts = self.config.actor_rollout_ref.rollout.n
-                    original_idx = idx // n_rollouts
-                    # truncated_input_ids = original_batch.batch["input_ids"][original_idx]
-                    truncated_input_ids = torch.cat([
-                        original_batch.batch["input_ids"][original_idx],
-                        responses[idx, :branch_point]
-                    ], dim=0)
+                min_branch_point = min(min_branch_point, branch_point)
 
-                # Create attention mask for the truncated input
+                truncated_input_ids = torch.cat([
+                    valid_prompt,
+                    current_response[:branch_point]
+                ], dim=0)
                 truncated_attention_mask = torch.ones_like(truncated_input_ids)
 
                 # Store for batch creation
@@ -1019,6 +982,14 @@ class RayPPOTrainer:
                     "input_ids": truncated_input_ids.unsqueeze(0),
                     "attention_mask": truncated_attention_mask.unsqueeze(0),
                 })
+                # print(f"==================== DEBUG: View response {idx} ====================\n"
+                #       f"Valid prompt length: {prompt_length - valid_prompt_start}\n"
+                #       f"Valid prompt decoded: {self.tokenizer.decode(full_input_ids[idx][valid_prompt_start:prompt_length], skip_special_tokens=False)}"
+                #       f"Valid response length: {valid_response_length}, branch point: {branch_point}\n"
+                #       f"Valid response decoded: {self.tokenizer.decode(current_response[:valid_response_length], skip_special_tokens=False)}\n"
+                #       f"Branched input decoded: {self.tokenizer.decode(truncated_input_ids, skip_special_tokens=False)}\n"
+                #       f"Branched input length: {len(truncated_input_ids)}\n"
+                #      f"==========================================================================\n\n")
 
             # Create a new DataProto for branched generation
             # Need to pad sequences to the same length before concatenating
@@ -1036,16 +1007,17 @@ class RayPPOTrainer:
             for b in branched_batches:
                 seq_len = b["input_ids"].shape[1]
                 if seq_len < max_length:
-                    # Pad on the right (typical for generation)
+                    # Pad on the left (for decoder-only models)
                     padding_length = max_length - seq_len
-                    # Use 0 as padding token (will be masked out by attention_mask)
+                    # Left pad with pad_id
                     padded_ids = torch.cat([
-                        b["input_ids"],
-                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device)
+                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device),
+                        b["input_ids"]
                     ], dim=1)
+                    # Left pad attention mask with zeros (padding tokens should not be attended to)
                     padded_mask = torch.cat([
-                        b["attention_mask"],
-                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device)
+                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device),
+                        b["attention_mask"]
                     ], dim=1)
                 else:
                     padded_ids = b["input_ids"]
@@ -1053,6 +1025,13 @@ class RayPPOTrainer:
 
                 padded_input_ids.append(padded_ids)
                 padded_attention_mask.append(padded_mask)
+
+                # print(f"==================== DEBUG: View padded sequence {idx} ====================")
+                # print(f"Max sequence length: {max_length}\n"
+                #       f"Sequence length: {seq_len}\n"
+                #       f"Sequence decoded: \n{self.tokenizer.decode(b['input_ids'][0], skip_special_tokens=False)}\n"
+                #       f"Padded attention mask: {padded_mask}\n"
+                #       f"==========================================================================\n\n")
 
             branched_input_ids = torch.cat(padded_input_ids, dim=0)
             branched_attention_mask = torch.cat(padded_attention_mask, dim=0)
@@ -1072,7 +1051,11 @@ class RayPPOTrainer:
                     "position_ids": branched_position_ids,
                 },
                 non_tensors=gen_batch_output.non_tensor_batch.copy(),
-                meta_info=gen_batch_output.meta_info.copy(),
+                meta_info={
+                    **gen_batch_output.meta_info,
+                    "is_branched": True,
+                    "remaining_response_budget": response_length - min_branch_point - 1,
+                }
             )
 
             # Generate continuations from branch points
@@ -1246,6 +1229,14 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # Cache ground truths once so that all rollouts (including branched ones)
+                # share the same gts label when dumping generations.
+                if "reward_model" in batch.non_tensor_batch:
+                    rm_arr = batch.non_tensor_batch["reward_model"]
+                    # rm_arr can be a NumPy array or list of dicts
+                    ground_truths = [item.get("ground_truth", None) for item in rm_arr]
+                    batch.non_tensor_batch["gts"] = np.array(ground_truths, dtype=object)
+
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -1272,7 +1263,7 @@ class RayPPOTrainer:
                             original_batch_for_branching, gen_batch_output, timing_raw
                         )
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX: 
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -1293,12 +1284,54 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # repeat to align with repeated responses in rollout
-                    repeat_factor = self.config.actor_rollout_ref.rollout.n
+                    # repeat / align non-tensor metadata to match generated rollouts
+                    #
+                    # - Without branching: we keep the original behavior, repeating the
+                    #   whole batch `n` times and then union'ing the generated tensors.
+                    # - With branching enabled: `gen_batch_output` already contains both
+                    #   original and branched rollouts (2n per example), so we rebuild
+                    #   a new DataProto whose tensors come from `gen_batch_output` and
+                    #   whose non-tensor metadata (e.g., reward_model, data_source, uid)
+                    #   are expanded to length 2n per original example. This avoids
+                    #   misalignment between prompts/responses and ground-truth labels.
+                    n_rollouts = self.config.actor_rollout_ref.rollout.n
                     if enable_branching:
-                        repeat_factor *= 2
-                    batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        # Original batch size before any rollout repetition
+                        base_batch_size = len(batch)
+
+                        expanded_non_tensors: dict[str, np.ndarray] = {}
+                        for key, val in batch.non_tensor_batch.items():
+                            # Only expand along the first dimension if it matches the base
+                            # batch size; leave other metadata (e.g., scalars) untouched.
+                            if isinstance(val, np.ndarray) and val.shape[0] == base_batch_size:
+                                # First repeat per rollout, then duplicate for branched and
+                                # non-branched rollouts: shape becomes (base_batch_size * 2n, ...)
+                                repeated = np.repeat(val, n_rollouts, axis=0)
+                                expanded_non_tensors[key] = np.concatenate([repeated, repeated], axis=0)
+                            else:
+                                expanded_non_tensors[key] = val
+
+                        # Merge rollout-specific non-tensors from gen_batch_output
+                        # (e.g., cached gts) which already have the correct length
+                        # and ordering matching `gen_batch_output.batch`.
+                        for key, val in gen_batch_output.non_tensor_batch.items():
+                            expanded_non_tensors[key] = val
+
+                        # Rebuild `batch` so that:
+                        #   - tensors (prompts, responses, attention_mask, etc.) come
+                        #     directly from the combined generation outputs
+                        #   - non-tensors (reward_model, data_source, gts, uid, ...) are
+                        #     aligned 1:1 with those tensors
+                        batch = DataProto.from_dict(
+                            tensors=gen_batch_output.batch,
+                            non_tensors=expanded_non_tensors,
+                            meta_info=gen_batch_output.meta_info.copy(),
+                        )
+                    else:
+                        # Original (non-branching) behavior: repeat to align with n rollouts
+                        repeat_factor = n_rollouts
+                        batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1323,6 +1356,40 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                            # # Minimal temporary debug printing for reward pipeline
+                            # try:
+                            #     batch_size = len(batch.batch)
+                            #     if reward_tensor.ndim >= 2:
+                            #         sample_scores = reward_tensor.sum(-1).detach().cpu().tolist()
+                            #     else:
+                            #         sample_scores = reward_tensor.detach().cpu().tolist()
+
+                            #     gts_arr = batch.non_tensor_batch.get("gts", None)
+                            #     responses = (
+                            #         self.tokenizer.batch_decode(
+                            #             batch.batch["responses"], skip_special_tokens=True
+                            #         )
+                            #         if "responses" in batch.batch
+                            #         else [None] * batch_size
+                            #     )
+
+                            #     for i in range(batch_size):
+                            #         gt = gts_arr[i] if gts_arr is not None else None
+                            #         prompt_snip = (
+                            #             self.tokenizer.decode(batch.batch["prompts"][i], skip_special_tokens=True)
+                            #             if batch.batch["prompts"][i] is not None
+                            #             else None
+                            #         )
+                            #         resp_snip = (
+                            #             responses[i][-50:] if responses[i] is not None else None
+                            #         )
+                            #         print(
+                            #             f"[REWARD_DEBUG] step={self.global_steps} idx={i} score={sample_scores[i]!r} "
+                            #             f"\"gts\": {gt!r} \"prompt\": {prompt_snip!r} \"response\": {resp_snip!r}"
+                            #         )
+                            # except Exception as e:
+                            #     print(f"[REWARD_DEBUG] error while logging reward debug info: {e}")
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1415,10 +1482,17 @@ class RayPPOTrainer:
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            sample_gts = [
-                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-                                for item in batch
-                            ]
+
+                            # Prefer cached gts so that branched and non-branched rollouts
+                            # for the same original example share identical labels.
+                            if "gts" in batch.non_tensor_batch:
+                                sample_gts = batch.non_tensor_batch["gts"].tolist()
+                            else:
+                                # Fallback for older runs or configs without cached gts
+                                sample_gts = [
+                                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                    for item in batch
+                                ]
 
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
