@@ -908,7 +908,7 @@ class RayPPOTrainer:
     
 
     def _create_branched_rollouts(
-        self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict
+        self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict, branch_algo: str = "random"
     ) -> DataProto:
         """
         Creates branched rollouts from the original generated rollouts.
@@ -964,10 +964,18 @@ class RayPPOTrainer:
                         current_response = current_response[:first_invalid_response]
                 valid_response_length = len(current_response)
 
-                if valid_response_length <= 2:
+                if valid_response_length <= 5:
                     branch_point = valid_response_length
                 else:
-                    branch_point = random.randint(0, valid_response_length - 1)
+                    if branch_algo == "random":
+                        branch_point = random.randint(0, valid_response_length - 4)
+                    elif branch_algo == "entropy":
+                        rollout_log_probs = gen_batch_output.batch.get("rollout_log_probs")
+                        if rollout_log_probs is not None:
+                            sample_log_probs = rollout_log_probs[idx, :valid_response_length - 4]
+                            branch_point = sample_log_probs.argmin().item() if len(sample_log_probs) > 0 else 0
+                        else:
+                            branch_point = random.randint(0, valid_response_length - 4)
 
                 min_branch_point = min(min_branch_point, branch_point)
 
@@ -1259,8 +1267,9 @@ class RayPPOTrainer:
                     if enable_branching:
                         # Store original batch before repeating for branching function
                         original_batch_for_branching = batch
+                        branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
                         gen_batch_output = self._create_branched_rollouts(
-                            original_batch_for_branching, gen_batch_output, timing_raw
+                            original_batch_for_branching, gen_batch_output, timing_raw, branch_algo=branch_algo
                         )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
