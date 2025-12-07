@@ -1296,9 +1296,30 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     repeat_factor = self.config.actor_rollout_ref.rollout.n
                     if enable_branching:
-                        repeat_factor *= 2
-                    batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        # original batch size
+                        base_batch_size = len(batch)
+
+                        expanded_non_tensors: dict[str, np.ndarray] = {}
+                        for key, val in batch.non_tensor_batch.items():
+                            if isinstance(val, np.ndarray) and val.shape[0] == base_batch_size:
+                                repeated = np.repeat(val, repeat_factor, axis=0)
+                                expanded_non_tensors[key] = np.concatenate([repeated, repeated], axis=0)
+                            else:
+                                expanded_non_tensors[key] = val
+                        
+                        # merge rollout-specific non-tensor from gen_batch_output
+                        for key, val in gen_batch_output.non_tensor_batch.items():
+                            expanded_non_tensors[key] = val
+
+                        # rebuild batch so tensors and non-tensors are aligned
+                        batch = DataProto(
+                            batch=gen_batch_output.batch, 
+                            non_tensor_batch=expanded_non_tensors, 
+                            meta_info=gen_batch_output.meta_info.copy())
+                    else:
+                        repeat_factor = n_rollouts
+                        batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
