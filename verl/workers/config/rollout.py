@@ -119,6 +119,7 @@ class RolloutConfig(BaseConfig):
     max_num_batched_tokens: int = 8192
     enable_trajectory_branching: bool = False
     branch_algo: str = "random"
+    branch_first_n_tokens: float = 1.0  # If < 1.0, fraction of response to consider for branching; otherwise use response_length - 4
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)

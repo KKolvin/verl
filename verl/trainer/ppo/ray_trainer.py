@@ -905,10 +905,10 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-    
 
     def _create_branched_rollouts(
-        self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict, branch_algo: str = "random"
+        self, original_batch: DataProto, gen_batch_output: DataProto, timing_raw: dict, 
+        branch_algo: str = "random", branch_first_n_tokens: float = 1.0,
     ) -> DataProto:
         """
         Creates branched rollouts from the original generated rollouts.
@@ -950,6 +950,10 @@ class RayPPOTrainer:
             # Create branched rollouts
             branched_batches = []
 
+            # Pre-fetch for branch point computation (avoid repeated dict lookups in loop)
+            use_entropy = branch_algo == "entropy"
+            rollout_log_probs = gen_batch_output.batch.get("rollout_log_probs") if use_entropy else None
+
             min_branch_point = response_length
             for idx in range(batch_size):
                 prompt_length = full_input_ids.shape[1] - response_length
@@ -964,18 +968,16 @@ class RayPPOTrainer:
                         current_response = current_response[:first_invalid_response]
                 valid_response_length = len(current_response)
 
+                # compute branch point
                 if valid_response_length <= 5:
                     branch_point = valid_response_length
                 else:
-                    if branch_algo == "random":
-                        branch_point = random.randint(0, valid_response_length - 4)
-                    elif branch_algo == "entropy":
-                        rollout_log_probs = gen_batch_output.batch.get("rollout_log_probs")
-                        if rollout_log_probs is not None:
-                            sample_log_probs = rollout_log_probs[idx, :valid_response_length - 4]
-                            branch_point = sample_log_probs.argmin().item() if len(sample_log_probs) > 0 else 0
-                        else:
-                            branch_point = random.randint(0, valid_response_length - 4)
+                    branch_end = int(valid_response_length * branch_first_n_tokens) if branch_first_n_tokens < 1.0 else valid_response_length - 4
+                    if use_entropy and rollout_log_probs is not None:
+                        sample_log_probs = rollout_log_probs[idx, :branch_end]
+                        branch_point = sample_log_probs.argmin().item() if len(sample_log_probs) > 0 else random.randint(0, branch_end)
+                    else:
+                        branch_point = random.randint(0, branch_end)
 
                 min_branch_point = min(min_branch_point, branch_point)
 
@@ -1268,8 +1270,10 @@ class RayPPOTrainer:
                         # Store original batch before repeating for branching function
                         original_batch_for_branching = batch
                         branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
+                        branch_first_n_tokens = self.config.actor_rollout_ref.rollout.get("branch_first_n_tokens", 1.0)
                         gen_batch_output = self._create_branched_rollouts(
-                            original_batch_for_branching, gen_batch_output, timing_raw, branch_algo=branch_algo
+                            original_batch_for_branching, gen_batch_output, timing_raw,
+                            branch_algo=branch_algo, branch_first_n_tokens=branch_first_n_tokens,
                         )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
