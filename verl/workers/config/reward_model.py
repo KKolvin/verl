@@ -16,10 +16,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from verl.base_config import BaseConfig
-from verl.utils.profiler import ProfilerConfig
 
 from .model import HFModelConfig
-from .rollout import SamplingConfig, ServerConfig
+from .rollout import RolloutConfig
 
 __all__ = ["SandboxFusionConfig", "RewardModelConfig"]
 
@@ -43,27 +42,14 @@ class SandboxFusionConfig(BaseConfig):
 class RewardModelConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields
 
+    reward_manager: str = "naive"
+
     enable: bool = False
-    model_type: str = "discriminative"
-    name: str = "sglang"
     enable_resource_pool: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
-    reward_manager: str = "naive"
-    launch_reward_fn_async: bool = False
 
-    dtype: str = "bfloat16"
-    gpu_memory_utilization: float = 0.5
-    free_cache_engine: bool = True
-    tensor_model_parallel_size: int = 2
-    sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
-
-    engine_kwargs: dict = field(default_factory=dict)
-    max_num_seqs: int = 1024
-
+    # reward model args
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    model: HFModelConfig = field(default_factory=HFModelConfig)
     sandbox_fusion: SandboxFusionConfig = field(default_factory=SandboxFusionConfig)
-    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
-    input_model_config: HFModelConfig = field(default_factory=HFModelConfig)
-    model_config: HFModelConfig = field(default_factory=HFModelConfig)
-    # Server configuration for sglang server mode
-    server: ServerConfig = field(default_factory=ServerConfig)
