@@ -220,6 +220,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.vocab_size = len(tokenizer)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -408,6 +409,245 @@ class vLLMRollout(BaseRollout):
             batch["rollout_log_probs"] = rollout_log_probs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    @GPUMemoryLogger(role="vllm rollout spmd branching", logger=logger)
+    @torch.no_grad()
+    def generate_sequences_with_branching(
+        self, 
+        prompts: DataProto, 
+        branch_first_n_tokens: float = 0.2,
+        branch_algo: str = "random",
+        **kwargs
+    ) -> DataProto:
+        """Generate sequences with in-flight branching for efficient trajectory exploration.
+        
+        Instead of generating n rollouts and then branching separately, this method:
+        1. Submits initial requests to vLLM
+        2. As each request completes, immediately computes branch point and submits branched request
+        3. vLLM's continuous batching handles both original and branched requests together
+        
+        This reduces overhead from 2 separate generation calls to 1 continuous generation.
+        
+        Args:
+            prompts: Input batch with prompts (already repeated n times)
+            branch_first_n_tokens: Fraction of response to consider for branch points (0.0-1.0)
+            branch_algo: Algorithm for selecting branch points ("random" or "entropy")
+            **kwargs: Additional sampling parameters
+            
+        Returns:
+            DataProto: Combined batch with original (n) and branched (n) rollouts (2n total)
+        """
+        import random
+        from vllm import RequestOutput
+        from vllm.inputs import TokensPrompt
+        
+        idx = prompts.batch["input_ids"]  # (bs, prompt_length) - already repeated n times
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        
+        batch_size = idx.size(0)  # This is n * original_batch_size
+        prompt_length = idx.size(1)
+        response_length = self.config.response_length
+        device = idx.device
+        
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
+        
+        # Prepare vLLM inputs
+        raw_prompt_ids_list = list(non_tensor_batch.pop("raw_prompt_ids"))
+        
+        # Get sampling params
+        do_sample = prompts.meta_info.get("do_sample", True)
+        if not do_sample:
+            kwargs = {"best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0, "temperature": 0, "n": 1}
+        
+        # Access the underlying LLM engine for fine-grained control
+        llm_engine = self.inference_engine.llm_engine
+        
+        # Tracking structures
+        original_requests = {}  # request_id -> (index, prompt_ids)
+        branched_requests = {}  # request_id -> (original_index, branch_point, original_prefix)
+        original_results = {}   # index -> (token_ids, log_probs)
+        branched_results = {}   # original_index -> (token_ids, log_probs)
+        
+        # Submit all original requests
+        with self.update_sampling_params(**kwargs):
+            for i in range(batch_size):
+                request_id = f"orig_{i}"
+                prompt_ids = list(raw_prompt_ids_list[i])
+                original_requests[request_id] = (i, prompt_ids)
+                
+                llm_engine.add_request(
+                    request_id=request_id,
+                    prompt=TokensPrompt(prompt_token_ids=prompt_ids),
+                    params=self.sampling_params,
+                )
+            
+            # Process requests with in-flight branching
+            while llm_engine.has_unfinished_requests():
+                step_outputs = llm_engine.step()
+                
+                for output in step_outputs:
+                    if not output.finished:
+                        continue
+                    
+                    request_id = output.request_id
+                    response_ids = list(output.outputs[0].token_ids)
+                    log_probs = None
+                    if self.config.calculate_log_probs and output.outputs[0].logprobs:
+                        log_probs = [
+                            lp[response_ids[i]].logprob 
+                            for i, lp in enumerate(output.outputs[0].logprobs)
+                        ]
+                    
+                    if request_id.startswith("orig_"):
+                        # Original request completed
+                        orig_idx = original_requests[request_id][0]
+                        original_prompt_ids = original_requests[request_id][1]
+                        original_results[orig_idx] = (response_ids, log_probs)
+                        
+                        # Check if we should branch (only if not already branched)
+                        if orig_idx not in branched_results:
+                            # Compute branch point
+                            valid_len = len(response_ids)
+                            for j, tok in enumerate(response_ids):
+                                if tok == self.pad_token_id or tok >= self.vocab_size:
+                                    valid_len = j
+                                    break
+                            
+                            if valid_len > 5:
+                                # Compute branch point based on algorithm
+                                if branch_first_n_tokens < 1.0:
+                                    branch_end = int(valid_len * branch_first_n_tokens)
+                                else:
+                                    branch_end = max(0, valid_len - 4)
+                                
+                                if branch_algo == "entropy" and log_probs is not None:
+                                    # Pick position with lowest log prob (highest uncertainty)
+                                    valid_log_probs = log_probs[:branch_end] if branch_end > 0 else [0]
+                                    branch_point = valid_log_probs.index(min(valid_log_probs))
+                                else:
+                                    # Random branch point
+                                    branch_point = random.randint(0, max(1, branch_end) - 1) if branch_end > 0 else 0
+                                
+                                # Create branched prompt: original_prompt + response[:branch_point]
+                                prefix = response_ids[:branch_point]
+                                branched_prompt_ids = original_prompt_ids + prefix
+                                remaining_budget = response_length - branch_point - 1
+                                
+                                # Submit branched request
+                                branched_request_id = f"branch_{orig_idx}"
+                                branched_requests[branched_request_id] = (orig_idx, branch_point, prefix)
+                                
+                                # Create sampling params with reduced max_tokens
+                                branched_sampling_params = self.sampling_params.clone()
+                                branched_sampling_params.max_tokens = min(remaining_budget, response_length)
+                                
+                                llm_engine.add_request(
+                                    request_id=branched_request_id,
+                                    prompt=TokensPrompt(prompt_token_ids=branched_prompt_ids),
+                                    params=branched_sampling_params,
+                                )
+                            else:
+                                # Response too short, use original response as branched
+                                branched_results[orig_idx] = (response_ids, log_probs, 0)
+                    
+                    elif request_id.startswith("branch_"):
+                        # Branched request completed
+                        orig_idx, branch_point, prefix = branched_requests[request_id]
+                        # Full branched response = prefix + continuation
+                        full_response = list(prefix) + response_ids
+                        branched_results[orig_idx] = (full_response, log_probs, branch_point)
+        
+        # Handle any originals that weren't branched (very short responses)
+        for orig_idx in range(batch_size):
+            if orig_idx not in branched_results:
+                branched_results[orig_idx] = (original_results[orig_idx][0], original_results[orig_idx][1], 0)
+        
+        # Convert results to tensors
+        original_responses = []
+        branched_responses = []
+        original_log_probs = []
+        branched_log_probs = []
+        
+        for i in range(batch_size):
+            original_responses.append(original_results[i][0])
+            branched_responses.append(branched_results[i][0])
+            if self.config.calculate_log_probs:
+                original_log_probs.append(original_results[i][1] or [])
+                branched_log_probs.append(branched_results[i][1] or [])
+        
+        # Pad responses to same length
+        max_orig_len = max(len(r) for r in original_responses)
+        max_branch_len = max(len(r) for r in branched_responses)
+        max_response_len = max(max_orig_len, max_branch_len, response_length)
+        
+        original_responses = pad_2d_list_to_length(
+            original_responses, self.pad_token_id, max_length=max_response_len
+        ).to(device)
+        branched_responses = pad_2d_list_to_length(
+            branched_responses, self.pad_token_id, max_length=max_response_len
+        ).to(device)
+        
+        if self.config.calculate_log_probs:
+            original_log_probs = pad_2d_list_to_length(
+                original_log_probs, -1, max_length=max_response_len
+            ).to(device).float()
+            branched_log_probs = pad_2d_list_to_length(
+                branched_log_probs, -1, max_length=max_response_len
+            ).to(device).float()
+        
+        # Build output tensors
+        # Stack original and branched: [orig_0, orig_1, ..., branch_0, branch_1, ...]
+        all_responses = torch.cat([original_responses, branched_responses], dim=0)
+        all_prompts = idx.repeat(2, 1)  # Repeat prompts for both original and branched
+        all_seq = torch.cat([all_prompts, all_responses], dim=-1)
+        
+        # Build attention mask
+        response_attention_mask = get_response_mask(
+            response_id=all_responses, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        all_attention_mask = torch.cat(
+            [attention_mask.repeat(2, 1), response_attention_mask], dim=-1
+        )
+        
+        # Build position IDs
+        delta_position_id = torch.arange(1, max_response_len + 1, device=device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size * 2, -1)
+        if position_ids.dim() == 3:
+            delta_position_id = delta_position_id.view(batch_size * 2, 1, -1).expand(batch_size * 2, 3, -1)
+        response_position_ids = position_ids.repeat(2, 1)[..., -1:] + delta_position_id
+        all_position_ids = torch.cat([position_ids.repeat(2, 1), response_position_ids], dim=-1)
+        
+        # Build batch
+        batch = TensorDict(
+            {
+                "prompts": all_prompts,
+                "responses": all_responses,
+                "input_ids": all_seq,
+                "attention_mask": all_attention_mask,
+                "position_ids": all_position_ids,
+            },
+            batch_size=batch_size * 2,
+        )
+        
+        if self.config.calculate_log_probs:
+            all_log_probs = torch.cat([original_log_probs, branched_log_probs], dim=0)
+            batch["rollout_log_probs"] = all_log_probs
+        
+        # Duplicate non_tensor_batch for both original and branched
+        combined_non_tensors = {}
+        for key, val in non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                combined_non_tensors[key] = np.tile(val, 2)
+            else:
+                combined_non_tensors[key] = val * 2
+        
+        return DataProto(batch=batch, non_tensor_batch=combined_non_tensors)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

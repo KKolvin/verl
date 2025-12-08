@@ -118,6 +118,7 @@ class RolloutConfig(BaseConfig):
     tensor_model_parallel_size: int = 2
     max_num_batched_tokens: int = 8192
     enable_trajectory_branching: bool = False
+    use_inflight_branching: bool = True  # If True, use optimized in-flight branching (single generation call)
     branch_algo: str = "random"
     branch_first_n_tokens: float = 1.0  # If < 1.0, fraction of response to consider for branching; otherwise use response_length - 4
 

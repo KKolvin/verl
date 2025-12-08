@@ -92,22 +92,22 @@ class NaiveRewardManager(AbstractRewardManager):
             )
 
             # Minimal reward debug logging
-            split = data_item.non_tensor_batch.get("split", "train")
-            if split == "train":
-                if isinstance(score, dict):
-                    debug_score = score.get("score", score)
-                else:
-                    debug_score = score
+            # split = data_item.non_tensor_batch.get("split", "train")
+            # if split == "train":
+            #     if isinstance(score, dict):
+            #         debug_score = score.get("score", score)
+            #     else:
+            #         debug_score = score
 
-                print(
-                    "[REWARD_MANAGER_DEBUG]"
-                    f" idx={i}"
-                    f" ds={data_source!r}"
-                    f" \"score\": {debug_score!r}"
-                    f" \"gts\": {ground_truth!r}"
-                    f" \"prompt\": {prompt_str.replace('\r', '').replace('\n', ' ')}\n"
-                    f" \"response\": {response_str.replace('\r', '').replace('\n', ' ')}\n"
-                )
+            #     print(
+            #         "[REWARD_MANAGER_DEBUG]"
+            #         f" idx={i}"
+            #         f" ds={data_source!r}"
+            #         f" \"score\": {debug_score!r}"
+            #         f" \"gts\": {ground_truth!r}"
+            #         f" \"prompt\": {prompt_str.replace('\r', '').replace('\n', ' ')}\n"
+            #         f" \"response\": {response_str.replace('\r', '').replace('\n', ' ')}\n"
+            #     )
 
             if isinstance(score, dict):
                 reward = score["score"]

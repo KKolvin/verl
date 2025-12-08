@@ -991,18 +991,37 @@ class RayPPOTrainer:
             branched_input_ids = torch.full((batch_size, max_length), pad_id, dtype=torch.long, device=device)
             branched_attention_mask = torch.zeros((batch_size, max_length), dtype=attention_mask.dtype, device=device)
 
-            # fill branched input_ids and attention_mask
-            for idx in range(batch_size):
-                out_len = output_lengths[idx].item()
-                pad_len = max_length - out_len
-                vps = valid_prompt_starts[idx].item()
-                vpl = valid_prompt_lengths[idx].item()
-                bp = branch_points[idx].item()
-
-                branched_input_ids[idx, pad_len:pad_len + vpl] = full_input_ids[idx, vps:prompt_length]
-                if bp > 0:
-                    branched_input_ids[idx, pad_len + vpl:pad_len + out_len] = responses[idx, :bp]
-                branched_attention_mask[idx, pad_len:] = 1
+            # Vectorized fill of branched input_ids and attention_mask
+            # Pre-compute all indices without Python loop
+            pad_lens = max_length - output_lengths  # (batch_size,)
+            col_indices = torch.arange(max_length, device=device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Mask for where prompt tokens go: [pad_len, pad_len + vpl)
+            prompt_start_pos = pad_lens.unsqueeze(1)
+            prompt_end_pos = prompt_start_pos + valid_prompt_lengths.unsqueeze(1)
+            prompt_mask = (col_indices >= prompt_start_pos) & (col_indices < prompt_end_pos)
+            
+            # Compute source indices for prompts (relative to valid_prompt_starts)
+            prompt_src_indices = col_indices - prompt_start_pos + valid_prompt_starts.unsqueeze(1)
+            prompt_src_indices = prompt_src_indices.clamp(0, prompt_length - 1)
+            prompt_values = full_input_ids.gather(1, prompt_src_indices)
+            branched_input_ids = torch.where(prompt_mask, prompt_values, branched_input_ids)
+            
+            # Mask for where response prefix goes: [pad_len + vpl, pad_len + out_len)
+            response_start_pos = prompt_end_pos
+            response_end_pos = prompt_start_pos + output_lengths.unsqueeze(1)
+            response_mask = (col_indices >= response_start_pos) & (col_indices < response_end_pos)
+            
+            # Compute source indices for response prefix
+            response_src_indices = col_indices - response_start_pos
+            response_src_indices = response_src_indices.clamp(0, response_length - 1)
+            response_values = responses.gather(1, response_src_indices)
+            # Only copy response where bp > 0
+            response_mask = response_mask & (branch_points.unsqueeze(1) > 0)
+            branched_input_ids = torch.where(response_mask, response_values, branched_input_ids)
+            
+            # Attention mask: 1 for all positions >= pad_len
+            branched_attention_mask = (col_indices >= pad_lens.unsqueeze(1)).to(attention_mask.dtype)
 
             # ensure proper dtype for token IDs
             if branched_input_ids.dtype != torch.long:
@@ -1038,18 +1057,33 @@ class RayPPOTrainer:
 
             if "responses" in branched_output.batch:
                 branched_responses = branched_output.batch["responses"]
+                branched_resp_len = branched_responses.shape[1]
                 
-                max_fixed_len = branch_points.max().item() + branched_responses.shape[1]
+                max_fixed_len = branch_points.max().item() + branched_resp_len
                 
-                # build responses of prefix + continuation
+                # Vectorized build of responses: prefix + continuation
                 fixed_responses = torch.full(
                     (batch_size, max_fixed_len), pad_token_id,
                     dtype=responses.dtype, device=device
                 )
-                for i in range(batch_size):
-                    bp = branch_points[i].item()
-                    full = torch.cat([responses[i, :bp], branched_responses[i]])
-                    fixed_responses[i, :full.shape[0]] = full
+                
+                # Create position indices for the fixed_responses
+                col_indices = torch.arange(max_fixed_len, device=device).unsqueeze(0).expand(batch_size, -1)
+                
+                # Mask for prefix positions: [0, branch_point)
+                prefix_mask = col_indices < branch_points.unsqueeze(1)
+                prefix_src_indices = col_indices.clamp(0, response_length - 1)
+                prefix_values = responses.gather(1, prefix_src_indices)
+                fixed_responses = torch.where(prefix_mask, prefix_values, fixed_responses)
+                
+                # Mask for continuation positions: [branch_point, branch_point + branched_resp_len)
+                continuation_start = branch_points.unsqueeze(1)
+                continuation_end = continuation_start + branched_resp_len
+                continuation_mask = (col_indices >= continuation_start) & (col_indices < continuation_end)
+                continuation_src_indices = (col_indices - continuation_start).clamp(0, branched_resp_len - 1)
+                continuation_values = branched_responses.gather(1, continuation_src_indices)
+                fixed_responses = torch.where(continuation_mask, continuation_values, fixed_responses)
+                
                 branched_output.batch["responses"] = fixed_responses
                 
                 # reconstruct input_ids, attention_mask, position_ids, and prompts
@@ -1203,20 +1237,35 @@ class RayPPOTrainer:
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
                     enable_branching = self.config.actor_rollout_ref.rollout.get("enable_trajectory_branching", False)
-                    if enable_branching:
+                    use_inflight_branching = self.config.actor_rollout_ref.rollout.get("use_inflight_branching", True)
+                    branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
+                    branch_first_n_tokens = self.config.actor_rollout_ref.rollout.get("branch_first_n_tokens", 1.0)
+                    
+                    with marked_timer("gen", timing_raw, color="red"):
+                        if enable_branching and use_inflight_branching and not self.async_rollout_mode:
+                            # Use optimized in-flight branching: single generation call handles both
+                            # original rollouts and branched continuations together
+                            # Pass branching params through meta_info (dispatch expects only DataProto args)
+                            gen_batch.meta_info["branch_first_n_tokens"] = branch_first_n_tokens
+                            gen_batch.meta_info["branch_algo"] = branch_algo
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences_with_branching(gen_batch)
+                            if "timing" in gen_batch_output.meta_info:
+                                timing_raw.update(gen_batch_output.meta_info["timing"])
+                                gen_batch_output.meta_info.pop("timing", None)
+                        else:
+                            # Standard generation (or fallback for async mode)
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
+
+                    # Fallback branching for async mode or when inflight is disabled
+                    if enable_branching and (not use_inflight_branching or self.async_rollout_mode):
                         # Store original batch before repeating for branching function
                         original_batch_for_branching = batch
-                        branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
-                        branch_first_n_tokens = self.config.actor_rollout_ref.rollout.get("branch_first_n_tokens", 1.0)
                         gen_batch_output = self._create_branched_rollouts(
                             original_batch_for_branching, gen_batch_output, timing_raw,
                             branch_algo=branch_algo, branch_first_n_tokens=branch_first_n_tokens,
