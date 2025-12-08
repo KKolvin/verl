@@ -923,22 +923,20 @@ class RayPPOTrainer:
         Returns:
             DataProto: Combined batch with original and branched rollouts (2n total)
         """
-        import random
-
         with marked_timer("branch_rollouts", timing_raw, color="magenta"):
-            # Extract necessary data
+            # extract necessary data
             responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
             attention_mask = gen_batch_output.batch.get("attention_mask")
                 
-            # Get max token id to filter out invalid tokens
+            # get max token id to filter out invalid tokens
             max_token_id = self.tokenizer.vocab_size - 1
 
-            # Get the original input_ids from gen_batch_output or reconstruct
-            # The generated batch should have the full sequence (input + response)
+            # get the original input_ids from gen_batch_output or reconstruct
+            # the generated batch should have the full sequence (input + response)
             if "input_ids" in gen_batch_output.batch:
                 full_input_ids = gen_batch_output.batch["input_ids"]
             else:
-                # If input_ids not in gen_batch_output, we need to get them from original_batch
+                # if input_ids not in gen_batch_output, we need to get them from original_batch
                 # and repeat to match the rollouts
                 n_rollouts = self.config.actor_rollout_ref.rollout.n
                 original_input_ids = original_batch.batch["input_ids"]
@@ -946,111 +944,72 @@ class RayPPOTrainer:
 
             batch_size = responses.shape[0]
             response_length = responses.shape[1]
+            prompt_length = full_input_ids.shape[1] - response_length
+            device = responses.device
 
-            # Create branched rollouts
-            branched_batches = []
+            # compute valid prompt starts
+            valid_prompt_starts = attention_mask.argmax(dim=1)
+            valid_prompt_lengths = prompt_length - valid_prompt_starts
 
-            # Pre-fetch for branch point computation (avoid repeated dict lookups in loop)
+            # compute valid response lengths
+            valid_response_mask = (responses < max_token_id) & (responses != self.tokenizer.pad_token_id)
+            all_valid = valid_response_mask.all(dim=1)
+            first_invalid = (~valid_response_mask).float().argmax(dim=1)
+            response_length_tensor = torch.full((batch_size,), response_length, device=device, dtype=torch.long)
+            valid_response_lengths = torch.where(all_valid, response_length_tensor, first_invalid)
+
+            # get branching points
+            short_response_mask = valid_response_lengths <= 5
+            if branch_first_n_tokens < 1.0:
+                branch_ends = (valid_response_lengths.float() * branch_first_n_tokens).long()
+            else:
+                branch_ends = (valid_response_lengths - 4).clamp(min=0)
             use_entropy = branch_algo == "entropy"
             rollout_log_probs = gen_batch_output.batch.get("rollout_log_probs") if use_entropy else None
 
-            min_branch_point = response_length
+            if use_entropy and rollout_log_probs is not None:
+                # mask positions beyond branch_end
+                position_indices = torch.arange(response_length, device=device).unsqueeze(0)
+                valid_positions_mask = position_indices < branch_ends.unsqueeze(1)
+                masked_log_probs = rollout_log_probs.clone()
+                masked_log_probs[~valid_positions_mask] = float('inf')
+                branch_points = masked_log_probs.argmin(dim=1)
+                # handle empty ranges (branch_end == 0)
+                branch_points = torch.where(branch_ends == 0, torch.zeros_like(branch_points), branch_points)
+            else:
+                rand_vals = torch.rand(batch_size, device=device)
+                branch_points = (rand_vals * branch_ends.float()).long()
+    
+            # use valid_response_length for branch_point
+            branch_points = torch.where(short_response_mask, valid_response_lengths, branch_points)
+
+
+            output_lengths = valid_prompt_lengths + branch_points
+            max_length = output_lengths.max().item()
+            min_branch_point = branch_points.min().item()
+
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            branched_input_ids = torch.full((batch_size, max_length), pad_id, dtype=torch.long, device=device)
+            branched_attention_mask = torch.zeros((batch_size, max_length), dtype=attention_mask.dtype, device=device)
+
+            # fill branched input_ids and attention_mask
             for idx in range(batch_size):
-                prompt_length = full_input_ids.shape[1] - response_length
-                valid_prompt_start = attention_mask[idx].argmax().item()
-                valid_prompt = full_input_ids[idx, valid_prompt_start:prompt_length]
+                out_len = output_lengths[idx].item()
+                pad_len = max_length - out_len
+                vps = valid_prompt_starts[idx].item()
+                vpl = valid_prompt_lengths[idx].item()
+                bp = branch_points[idx].item()
 
-                current_response = responses[idx]
-                valid_response_mask = (current_response < max_token_id) & (current_response != self.tokenizer.pad_token_id)
-                # valid_response_ids = torch.where(valid_response_mask)[0]
-                if valid_response_mask.any():
-                        first_invalid_response = valid_response_mask.size(0) if valid_response_mask.all() else (valid_response_mask == False).nonzero(as_tuple=True)[0][0]
-                        current_response = current_response[:first_invalid_response]
-                valid_response_length = len(current_response)
+                branched_input_ids[idx, pad_len:pad_len + vpl] = full_input_ids[idx, vps:prompt_length]
+                if bp > 0:
+                    branched_input_ids[idx, pad_len + vpl:pad_len + out_len] = responses[idx, :bp]
+                branched_attention_mask[idx, pad_len:] = 1
 
-                # compute branch point
-                if valid_response_length <= 5:
-                    branch_point = valid_response_length
-                else:
-                    branch_end = int(valid_response_length * branch_first_n_tokens) if branch_first_n_tokens < 1.0 else valid_response_length - 4
-                    if use_entropy and rollout_log_probs is not None:
-                        sample_log_probs = rollout_log_probs[idx, :branch_end]
-                        branch_point = sample_log_probs.argmin().item() if len(sample_log_probs) > 0 else random.randint(0, branch_end)
-                    else:
-                        branch_point = random.randint(0, branch_end)
-
-                min_branch_point = min(min_branch_point, branch_point)
-
-                truncated_input_ids = torch.cat([
-                    valid_prompt,
-                    current_response[:branch_point]
-                ], dim=0)
-                truncated_attention_mask = torch.ones_like(truncated_input_ids)
-
-                # Store for batch creation
-                branched_batches.append({
-                    "input_ids": truncated_input_ids.unsqueeze(0),
-                    "attention_mask": truncated_attention_mask.unsqueeze(0),
-                })
-                # print(f"==================== DEBUG: View response {idx} ====================\n"
-                #       f"Valid prompt length: {prompt_length - valid_prompt_start}\n"
-                #       f"Valid prompt decoded: {self.tokenizer.decode(full_input_ids[idx][valid_prompt_start:prompt_length], skip_special_tokens=False)}"
-                #       f"Valid response length: {valid_response_length}, branch point: {branch_point}\n"
-                #       f"Valid response decoded: {self.tokenizer.decode(current_response[:valid_response_length], skip_special_tokens=False)}\n"
-                #       f"Branched input decoded: {self.tokenizer.decode(truncated_input_ids, skip_special_tokens=False)}\n"
-                #       f"Branched input length: {len(truncated_input_ids)}\n"
-                #      f"==========================================================================\n\n")
-
-            # Create a new DataProto for branched generation
-            # Need to pad sequences to the same length before concatenating
-            max_length = max(b["input_ids"].shape[1] for b in branched_batches)
-
-            # Pad all sequences to max_length
-            padded_input_ids = []
-            padded_attention_mask = []
-            
-            # Use tokenizer's pad token id (fallback to eos if pad is None)
-            pad_id = self.tokenizer.pad_token_id
-            if pad_id is None:
-                pad_id = self.tokenizer.eos_token_id
-
-            for b in branched_batches:
-                seq_len = b["input_ids"].shape[1]
-                if seq_len < max_length:
-                    # Pad on the left (for decoder-only models)
-                    padding_length = max_length - seq_len
-                    # Left pad with pad_id
-                    padded_ids = torch.cat([
-                        torch.full((1, padding_length), pad_id, dtype=b["input_ids"].dtype, device=b["input_ids"].device),
-                        b["input_ids"]
-                    ], dim=1)
-                    # Left pad attention mask with zeros (padding tokens should not be attended to)
-                    padded_mask = torch.cat([
-                        torch.zeros((1, padding_length), dtype=b["attention_mask"].dtype, device=b["attention_mask"].device),
-                        b["attention_mask"]
-                    ], dim=1)
-                else:
-                    padded_ids = b["input_ids"]
-                    padded_mask = b["attention_mask"]
-
-                padded_input_ids.append(padded_ids)
-                padded_attention_mask.append(padded_mask)
-
-                # print(f"==================== DEBUG: View padded sequence {idx} ====================")
-                # print(f"Max sequence length: {max_length}\n"
-                #       f"Sequence length: {seq_len}\n"
-                #       f"Sequence decoded: \n{self.tokenizer.decode(b['input_ids'][0], skip_special_tokens=False)}\n"
-                #       f"Padded attention mask: {padded_mask}\n"
-                #       f"==========================================================================\n\n")
-
-            branched_input_ids = torch.cat(padded_input_ids, dim=0)
-            branched_attention_mask = torch.cat(padded_attention_mask, dim=0)
-
-            # Ensure proper dtype for token IDs
+            # ensure proper dtype for token IDs
             if branched_input_ids.dtype != torch.long:
                 branched_input_ids = branched_input_ids.long()
 
-            # Compute and include position_ids for branched generation
+            # compute and include position_ids for branched generation
             from verl.utils.model import compute_position_id_with_mask
             branched_position_ids = compute_position_id_with_mask(branched_attention_mask)
 
@@ -1068,7 +1027,7 @@ class RayPPOTrainer:
                 }
             )
 
-            # Generate continuations from branch points
+            # generate continuations from branch points
             with marked_timer("gen_branched", timing_raw, color="purple"):
                 if not self.async_rollout_mode:
                     branched_output = self.actor_rollout_wg.generate_sequences(branched_gen_batch)
@@ -1077,31 +1036,28 @@ class RayPPOTrainer:
                 timing_raw.update(branched_output.meta_info.get("timing", {}))
                 branched_output.meta_info.pop("timing", None)
 
-            # Combine original and branched rollouts
-            # We need to merge the batches such that they can be processed together
+            # we need to merge the batches such that they can be processed together
             combined_tensors = {}
             combined_non_tensors = {}
 
-            # Merge batch tensors
             for key in gen_batch_output.batch.keys():
                 if key in branched_output.batch:
-                    # Check if tensors need padding (different sequence lengths)
+                    # check if tensors need padding (different sequence lengths)
                     orig_tensor = gen_batch_output.batch[key]
                     branch_tensor = branched_output.batch[key]
 
-                    # Only pad if we have 2D+ tensors with potential length mismatch
+                    # only pad if we have 2D+ tensors with potential length mismatch
                     if len(orig_tensor.shape) >= 2 and orig_tensor.shape[1] != branch_tensor.shape[1]:
                         max_seq_len = max(orig_tensor.shape[1], branch_tensor.shape[1])
                         
-                        # Determine the appropriate padding value based on the key
                         if key == "attention_mask":
-                            pad_value = 0  # Attention masks should be padded with 0
+                            pad_value = 0  # attention masks should be padded with 0
                         elif key in ["input_ids", "prompts", "responses"]:
                             pad_value = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
                         else:
-                            pad_value = 0  # Default to 0 for other tensors
+                            pad_value = 0  # default to 0 for other tensors
 
-                        # Pad original tensor if needed
+                        # pad original tensor
                         if orig_tensor.shape[1] < max_seq_len:
                             pad_len = max_seq_len - orig_tensor.shape[1]
                             pad_shape = list(orig_tensor.shape)
@@ -1109,7 +1065,7 @@ class RayPPOTrainer:
                             padding = torch.full(pad_shape, fill_value=pad_value, dtype=orig_tensor.dtype, device=orig_tensor.device)
                             orig_tensor = torch.cat([orig_tensor, padding], dim=1)
 
-                        # Pad branched tensor if needed
+                        # pad branched tensor
                         if branch_tensor.shape[1] < max_seq_len:
                             pad_len = max_seq_len - branch_tensor.shape[1]
                             pad_shape = list(branch_tensor.shape)
@@ -1119,13 +1075,13 @@ class RayPPOTrainer:
 
                         combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
                     else:
-                        # No padding needed, concatenate directly
+                        # no padding needed
                         combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
                 else:
-                    # If key only in original, duplicate it
+                    # if key only in original, duplicate it
                     combined_tensors[key] = gen_batch_output.batch[key].repeat(2, *([1] * (len(gen_batch_output.batch[key].shape) - 1)))
 
-            # Merge non-tensor batch
+            # merge non-tensor batch
             for key in gen_batch_output.non_tensor_batch.keys():
                 if key in branched_output.non_tensor_batch:
                     if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
@@ -1139,7 +1095,7 @@ class RayPPOTrainer:
                             branched_output.non_tensor_batch[key]
                         )
                 else:
-                    # Duplicate non-tensor entries
+                    # duplicate non-tensor entries
                     if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
                         combined_non_tensors[key] = np.tile(
                             gen_batch_output.non_tensor_batch[key], 2
@@ -1149,7 +1105,6 @@ class RayPPOTrainer:
                             gen_batch_output.non_tensor_batch[key] * 2
                         )
 
-            # Create DataProto from the combined dictionaries
             combined_batch = DataProto.from_dict(
                 tensors=combined_tensors,
                 non_tensors=combined_non_tensors,
@@ -1321,7 +1276,6 @@ class RayPPOTrainer:
                             non_tensor_batch=expanded_non_tensors, 
                             meta_info=gen_batch_output.meta_info.copy())
                     else:
-                        repeat_factor = n_rollouts
                         batch = batch.repeat(repeat_times=repeat_factor, interleave=True)
                         batch = batch.union(gen_batch_output)
 
