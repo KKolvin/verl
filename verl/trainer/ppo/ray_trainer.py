@@ -60,6 +60,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.model import compute_position_id_with_mask
 
 
 @dataclass
@@ -913,9 +914,7 @@ class RayPPOTrainer:
     ) -> DataProto:
         """
         Creates branched rollouts from the original generated rollouts.
-        For each rollout, picks a random point in the trajectory and branches off,
-        generating a new continuation. Returns a combined batch with 2n rollouts.
-
+        
         Args:
             original_batch: The original batch (unrepeated) with prompts
             gen_batch_output: The generated batch output with n rollouts per prompt
@@ -984,7 +983,6 @@ class RayPPOTrainer:
             # use valid_response_length for branch_point
             branch_points = torch.where(short_response_mask, valid_response_lengths, branch_points)
 
-
             output_lengths = valid_prompt_lengths + branch_points
             max_length = output_lengths.max().item()
             min_branch_point = branch_points.min().item()
@@ -1011,7 +1009,6 @@ class RayPPOTrainer:
                 branched_input_ids = branched_input_ids.long()
 
             # compute and include position_ids for branched generation
-            from verl.utils.model import compute_position_id_with_mask
             branched_position_ids = compute_position_id_with_mask(branched_attention_mask)
 
             branched_gen_batch = DataProto.from_dict(
@@ -1037,10 +1034,36 @@ class RayPPOTrainer:
                 timing_raw.update(branched_output.meta_info.get("timing", {}))
                 branched_output.meta_info.pop("timing", None)
 
-            # pad merge tensor batches to same length, then concatenate)
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            combined_tensors = {}
 
+            if "responses" in branched_output.batch:
+                branched_responses = branched_output.batch["responses"]
+                
+                max_fixed_len = branch_points.max().item() + branched_responses.shape[1]
+                
+                # build responses of prefix + continuation
+                fixed_responses = torch.full(
+                    (batch_size, max_fixed_len), pad_token_id,
+                    dtype=responses.dtype, device=device
+                )
+                for i in range(batch_size):
+                    bp = branch_points[i].item()
+                    full = torch.cat([responses[i, :bp], branched_responses[i]])
+                    fixed_responses[i, :full.shape[0]] = full
+                branched_output.batch["responses"] = fixed_responses
+                
+                # reconstruct input_ids, attention_mask, position_ids, and prompts
+                if "prompts" in gen_batch_output.batch:
+                    orig_prompts = gen_batch_output.batch["prompts"]
+                    branched_output.batch["input_ids"] = torch.cat([orig_prompts, fixed_responses], dim=1)
+                    branched_output.batch["prompts"] = orig_prompts.clone()
+                    
+                    orig_attn = gen_batch_output.batch["attention_mask"][:, :prompt_length]
+                    resp_attn = (fixed_responses != pad_token_id).to(orig_attn.dtype)
+                    branched_output.batch["attention_mask"] = torch.cat([orig_attn, resp_attn], dim=1)
+                    branched_output.batch["position_ids"] = compute_position_id_with_mask(branched_output.batch["attention_mask"])
+
+            combined_tensors = {}
             for key in gen_batch_output.batch.keys():
                 orig = gen_batch_output.batch[key]
                 if key not in branched_output.batch:
@@ -1048,7 +1071,7 @@ class RayPPOTrainer:
                     continue
 
                 branch = branched_output.batch[key]
-                # pad shorter tensor to match lengths (right-pad for dim=1)
+                # right-pad shorter tensor to match lengths
                 if orig.ndim >= 2 and orig.shape[1] != branch.shape[1]:
                     pad_val = 0 if key not in ["input_ids", "prompts", "responses"] else pad_token_id
                     max_len = max(orig.shape[1], branch.shape[1])
