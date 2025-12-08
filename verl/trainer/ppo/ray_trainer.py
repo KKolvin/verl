@@ -30,6 +30,7 @@ from typing import Optional
 import numpy as np
 import ray
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -1036,74 +1037,41 @@ class RayPPOTrainer:
                 timing_raw.update(branched_output.meta_info.get("timing", {}))
                 branched_output.meta_info.pop("timing", None)
 
-            # we need to merge the batches such that they can be processed together
+            # pad merge tensor batches to same length, then concatenate)
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             combined_tensors = {}
-            combined_non_tensors = {}
 
             for key in gen_batch_output.batch.keys():
-                if key in branched_output.batch:
-                    # check if tensors need padding (different sequence lengths)
-                    orig_tensor = gen_batch_output.batch[key]
-                    branch_tensor = branched_output.batch[key]
+                orig = gen_batch_output.batch[key]
+                if key not in branched_output.batch:
+                    combined_tensors[key] = orig.repeat(2, *([1] * (orig.ndim - 1)))
+                    continue
 
-                    # only pad if we have 2D+ tensors with potential length mismatch
-                    if len(orig_tensor.shape) >= 2 and orig_tensor.shape[1] != branch_tensor.shape[1]:
-                        max_seq_len = max(orig_tensor.shape[1], branch_tensor.shape[1])
-                        
-                        if key == "attention_mask":
-                            pad_value = 0  # attention masks should be padded with 0
-                        elif key in ["input_ids", "prompts", "responses"]:
-                            pad_value = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                        else:
-                            pad_value = 0  # default to 0 for other tensors
+                branch = branched_output.batch[key]
+                # pad shorter tensor to match lengths (right-pad for dim=1)
+                if orig.ndim >= 2 and orig.shape[1] != branch.shape[1]:
+                    pad_val = 0 if key not in ["input_ids", "prompts", "responses"] else pad_token_id
+                    max_len = max(orig.shape[1], branch.shape[1])
+                    if orig.shape[1] < max_len:
+                        orig = F.pad(orig, (0, max_len - orig.shape[1]), value=pad_val)
+                    if branch.shape[1] < max_len:
+                        branch = F.pad(branch, (0, max_len - branch.shape[1]), value=pad_val)
+                combined_tensors[key] = torch.cat([orig, branch], dim=0)
 
-                        # pad original tensor
-                        if orig_tensor.shape[1] < max_seq_len:
-                            pad_len = max_seq_len - orig_tensor.shape[1]
-                            pad_shape = list(orig_tensor.shape)
-                            pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=orig_tensor.dtype, device=orig_tensor.device)
-                            orig_tensor = torch.cat([orig_tensor, padding], dim=1)
-
-                        # pad branched tensor
-                        if branch_tensor.shape[1] < max_seq_len:
-                            pad_len = max_seq_len - branch_tensor.shape[1]
-                            pad_shape = list(branch_tensor.shape)
-                            pad_shape[1] = pad_len
-                            padding = torch.full(pad_shape, fill_value=pad_value, dtype=branch_tensor.dtype, device=branch_tensor.device)
-                            branch_tensor = torch.cat([branch_tensor, padding], dim=1)
-
-                        combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
-                    else:
-                        # no padding needed
-                        combined_tensors[key] = torch.cat([orig_tensor, branch_tensor], dim=0)
-                else:
-                    # if key only in original, duplicate it
-                    combined_tensors[key] = gen_batch_output.batch[key].repeat(2, *([1] * (len(gen_batch_output.batch[key].shape) - 1)))
-
-            # merge non-tensor batch
-            for key in gen_batch_output.non_tensor_batch.keys():
+            # merge non-tensor batches
+            combined_non_tensors = {}
+            for key, orig_val in gen_batch_output.non_tensor_batch.items():
                 if key in branched_output.non_tensor_batch:
-                    if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
-                        combined_non_tensors[key] = np.concatenate([
-                            gen_batch_output.non_tensor_batch[key],
-                            branched_output.non_tensor_batch[key]
-                        ])
+                    branch_val = branched_output.non_tensor_batch[key]
+                    if isinstance(orig_val, np.ndarray):
+                        combined_non_tensors[key] = np.concatenate([orig_val, branch_val])
                     else:
-                        combined_non_tensors[key] = (
-                            gen_batch_output.non_tensor_batch[key] +
-                            branched_output.non_tensor_batch[key]
-                        )
+                        combined_non_tensors[key] = orig_val + branch_val
                 else:
-                    # duplicate non-tensor entries
-                    if isinstance(gen_batch_output.non_tensor_batch[key], np.ndarray):
-                        combined_non_tensors[key] = np.tile(
-                            gen_batch_output.non_tensor_batch[key], 2
-                        )
+                    if isinstance(orig_val, np.ndarray):
+                        combined_non_tensors[key] = np.tile(orig_val, 2)
                     else:
-                        combined_non_tensors[key] = (
-                            gen_batch_output.non_tensor_batch[key] * 2
-                        )
+                        combined_non_tensors[key] = orig_val * 2
 
             combined_batch = DataProto.from_dict(
                 tensors=combined_tensors,
