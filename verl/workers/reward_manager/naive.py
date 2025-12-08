@@ -105,9 +105,8 @@ class NaiveRewardManager(AbstractRewardManager):
                     f" ds={data_source!r}"
                     f" \"score\": {debug_score!r}"
                     f" \"gts\": {ground_truth!r}"
-                    f" \"prompt\": {prompt_str}\n"
-                    f" \"response\": {response_str}\n"
-                    # f" \"resp_tail\": {self.tokenizer.decode(response_ids[-50:], skip_special_tokens=True)!r}"
+                    f" \"prompt\": {prompt_str.replace('\r', '').replace('\n', ' ')}\n"
+                    f" \"response\": {response_str.replace('\r', '').replace('\n', ' ')}\n"
                 )
 
             if isinstance(score, dict):
