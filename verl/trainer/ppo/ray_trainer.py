@@ -977,20 +977,15 @@ class RayPPOTrainer:
             DataProto: Combined batch with original and branched rollouts (2n total)
         """
         with marked_timer("branch_rollouts", timing_raw, color="magenta"):
-            # extract necessary data
             responses = gen_batch_output.batch["responses"]  # Shape: (n * batch_size, response_len)
             attention_mask = gen_batch_output.batch.get("attention_mask")
-                
-            # get max token id to filter out invalid tokens
             max_token_id = self.tokenizer.vocab_size - 1
 
-            # get the original input_ids from gen_batch_output or reconstruct
             # the generated batch should have the full sequence (input + response)
             if "input_ids" in gen_batch_output.batch:
                 full_input_ids = gen_batch_output.batch["input_ids"]
             else:
                 # if input_ids not in gen_batch_output, we need to get them from original_batch
-                # and repeat to match the rollouts
                 n_rollouts = self.config.actor_rollout_ref.rollout.n
                 original_input_ids = original_batch.batch["input_ids"]
                 full_input_ids = original_input_ids.repeat_interleave(n_rollouts, dim=0)
@@ -1044,24 +1039,35 @@ class RayPPOTrainer:
             branched_input_ids = torch.full((batch_size, max_length), pad_id, dtype=torch.long, device=device)
             branched_attention_mask = torch.zeros((batch_size, max_length), dtype=attention_mask.dtype, device=device)
 
-            # fill branched input_ids and attention_mask
-            for idx in range(batch_size):
-                out_len = output_lengths[idx].item()
-                pad_len = max_length - out_len
-                vps = valid_prompt_starts[idx].item()
-                vpl = valid_prompt_lengths[idx].item()
-                bp = branch_points[idx].item()
+            # vectorize attempt
+            pad_lens = max_length - output_lengths  # (batch_size,)
+            col_indices = torch.arange(max_length, device=device).unsqueeze(0).expand(batch_size, -1)
+            prompt_start_pos = pad_lens.unsqueeze(1)
+            prompt_end_pos = prompt_start_pos + valid_prompt_lengths.unsqueeze(1)
+            prompt_mask = (col_indices >= prompt_start_pos) & (col_indices < prompt_end_pos)
 
-                branched_input_ids[idx, pad_len:pad_len + vpl] = full_input_ids[idx, vps:prompt_length]
-                if bp > 0:
-                    branched_input_ids[idx, pad_len + vpl:pad_len + out_len] = responses[idx, :bp]
-                branched_attention_mask[idx, pad_len:] = 1
+            # get source indices for prompt
+            prompt_src_indices = col_indices - prompt_start_pos + valid_prompt_starts.unsqueeze(1)
+            prompt_src_indices = prompt_src_indices.clamp(0, prompt_length - 1)
+            prompt_values = full_input_ids.gather(1, prompt_src_indices)
+            branched_input_ids = torch.where(prompt_mask, prompt_values, branched_input_ids)
 
-            # ensure proper dtype for token IDs
+            # preocess response prefix
+            response_start_pos = prompt_end_pos
+            response_end_pos = prompt_start_pos + output_lengths.unsqueeze(1)
+            response_mask = (col_indices >= response_start_pos) & (col_indices < response_end_pos)
+            response_src_indices = col_indices - response_start_pos
+            response_src_indices = response_src_indices.clamp(0, response_length - 1)
+            response_values = responses.gather(1, response_src_indices)
+            # Only copy response where bp > 0
+            response_mask = response_mask & (branch_points.unsqueeze(1) > 0)
+            branched_input_ids = torch.where(response_mask, response_values, branched_input_ids)
+            branched_attention_mask = (col_indices >= pad_lens.unsqueeze(1)).to(attention_mask.dtype)
+
             if branched_input_ids.dtype != torch.long:
                 branched_input_ids = branched_input_ids.long()
 
-            # compute and include position_ids for branched generation
+            # compute position_ids for branched generation
             branched_position_ids = compute_position_id_with_mask(branched_attention_mask)
 
             branched_gen_batch = DataProto.from_dict(
@@ -1091,7 +1097,6 @@ class RayPPOTrainer:
 
             if "responses" in branched_output.batch:
                 branched_responses = branched_output.batch["responses"]
-                
                 max_fixed_len = branch_points.max().item() + branched_responses.shape[1]
                 
                 # build responses of prefix + continuation
@@ -1257,9 +1262,22 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    enable_branching = self.config.actor_rollout_ref.rollout.get("enable_trajectory_branching", False)
+                    use_inflight_branching = self.config.actor_rollout_ref.rollout.get("use_inflight_branching", True)
+                    branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
+                    branch_first_n_tokens = self.config.actor_rollout_ref.rollout.get("branch_first_n_tokens", 1.0)
+
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
+                        if enable_branching and use_inflight_branching and not self.async_rollout_mode:
+                            # in-flight batch: handles both original and branched together
+                            gen_batch.meta_info["branch_first_n_tokens"] = branch_first_n_tokens
+                            gen_batch.meta_info["branch_algo"] = branch_algo
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences_with_branching(gen_batch)
+                            if "timing" in gen_batch_output.meta_info:
+                                timing_raw.update(gen_batch_output.meta_info["timing"])
+                                gen_batch_output.meta_info.pop("timing", None)
+                        elif not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1267,12 +1285,9 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    enable_branching = self.config.actor_rollout_ref.rollout.get("enable_trajectory_branching", False)
                     if enable_branching:
-                        # Store original batch before repeating for branching function
+                        # if in-flight is disabled
                         original_batch_for_branching = batch
-                        branch_algo = self.config.actor_rollout_ref.rollout.get("branch_algo", "random")
-                        branch_first_n_tokens = self.config.actor_rollout_ref.rollout.get("branch_first_n_tokens", 1.0)
                         gen_batch_output = self._create_branched_rollouts(
                             original_batch_for_branching, gen_batch_output, timing_raw,
                             branch_algo=branch_algo, branch_first_n_tokens=branch_first_n_tokens,

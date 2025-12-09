@@ -961,6 +961,69 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().empty_cache()
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="rollout_generate_branching")
+    def generate_sequences_with_branching(self, prompts: DataProto): # only for in-flight branching
+        assert self._is_rollout
+        prompts = prompts.to(get_device_id())
+
+        branch_first_n_tokens = prompts.meta_info.get("branch_first_n_tokens", 1.0)
+        branch_algo = prompts.meta_info.get("branch_algo", "random")
+
+        meta_info = {
+            "eos_token_id": self.model_config.generation_config.eos_token_id
+            if self.model_config.generation_config is not None
+            else self.model_config.tokenizer.eos_token_id,
+            "pad_token_id": self.model_config.generation_config.pad_token_id
+            if self.model_config.generation_config is not None
+            else self.model_config.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        timing_generate = {}
+        # don't need to switch context for rollout
+        if self._is_actor:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.rollout_mode())
+            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+        
+        with simple_timer("generate_sequences_with_branching", timing_generate): # need to record this for reference of future optimization
+            if hasattr(self.rollout, 'generate_sequences_with_branching'):
+                output = self.rollout.generate_sequences_with_branching(
+                    prompts=prompts,
+                    branch_first_n_tokens=branch_first_n_tokens,
+                    branch_algo=branch_algo,
+                )
+            else:
+                print("Rollout does not support generate_sequences_with_branching, falling back to generate_sequences")
+                output = self.rollout.generate_sequences(prompts=prompts)
+        
+        if self._is_actor:
+            loop.run_until_complete(self.trainer_mode())
+            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+
+        # calculate timing across all ranks to include in wandb metrics
+        timing_key = "generate_sequences_with_branching"
+        if timing_key in timing_generate:
+            timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(timing_generate[timing_key])
+            timing_generate = reduce_timing(timing_generate)
+            timing_generate.update({
+                "generation_timing/max": timing_generate_max, 
+                "generation_timing/min": timing_generate_min, 
+                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            })
+        output.meta_info["timing"] = timing_generate
+        output = output.to("cpu")
+
+        # clear kv cache
+        get_torch_device().empty_cache()
+        return output
+
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
